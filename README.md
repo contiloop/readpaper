@@ -14,6 +14,7 @@ The workflow combines:
 - Python tools that fetch/prepare public PDFs, preserve canonical page text, detect logical sections, create bounded transport frames, render pages, manage locators, and verify state;
 - Codex Desktop hooks that bind user turns, protected tool calls, reviewer agents, compaction, and Stop delivery observations;
 - reviewer roles for math/visual checks, claim/experiment checks, and explanation-flow checks;
+- tests and host probes for the P0 Desktop acceptance gate.
 
 ## Repository layout
 
@@ -24,6 +25,7 @@ The workflow combines:
 ├── .codex/config.toml                 # project-local Codex settings
 ├── .codex/hooks/                      # hook entrypoints
 ├── scripts/install_readpaper.py       # generates local hook wiring
+├── tests/                             # automated unit and host-probe tests
 └── PROJECT_GOAL.md                    # product goal
 ```
 
@@ -67,6 +69,20 @@ You can verify the generated local wiring without rewriting it:
 ```sh
 python scripts/install_readpaper.py --check
 ```
+
+Run automated tests:
+
+```sh
+.venv/bin/python -m pytest -q
+```
+
+Optional P0 automated evidence can be generated with:
+
+```sh
+.venv/bin/python .agents/skills/readpaper/scripts/verify.py
+```
+
+That command writes ignored evidence under `evidence/`.
 
 ## Use
 
