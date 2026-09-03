@@ -23,12 +23,13 @@ def test_long_context_configuration() -> None:
     with (root / ".codex/config.toml").open("rb") as handle:
         config = tomllib.load(handle)
     assert config == {
-        "model_auto_compact_token_limit": 850000,
+        "model": "gpt-5.6-sol",
+        "model_context_window": 272000,
+        "model_auto_compact_token_limit": 230000,
         "model_auto_compact_token_limit_scope": "total",
         "tool_output_token_limit": 65536,
     }
-    model_context = 1_050_000
-    assert model_context - config["model_auto_compact_token_limit"] >= 200_000
+    assert config["model_context_window"] > config["model_auto_compact_token_limit"]
     assert 48_000 < config["tool_output_token_limit"]
 
 

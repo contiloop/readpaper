@@ -12,18 +12,19 @@ from .canonical import digest
 
 
 CLIENT_RE = re.compile(r"^cr_[0-9a-f]{32}$")
-COMMANDS = ("prepare", "read", "render", "record", "check", "answer", "resume", "delete")
+COMMANDS = ("prepare", "read", "render", "record", "check", "run", "answer", "resume", "delete")
 SCHEMA = {
-    "prepare": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ()},
+    "prepare": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ("--ingest-only",)},
     "read": {"positionals": 1, "required": ("--frame-id", "--client-request-id"), "optional": ()},
     "render": {"positionals": 1, "required": ("--unit-id", "--client-request-id"), "optional": ("--locator-id", "--render-dpi")},
     "record": {"positionals": 1, "required": ("--kind", "--payload", "--client-request-id"), "optional": ()},
     "check": {"positionals": 1, "required": (), "optional": ("--answer-id",)},
+    "run": {"positionals": 1, "required": ("--finalize-reading", "--task-id", "--user-turn-id", "--client-request-id"), "optional": ()},
     "answer": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ("--begin", "--resume", "--abandon", "--finalize", "--answer-id")},
     "resume": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ()},
     "delete": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ("--preview", "--execute", "--request-id", "--approval-turn-id")},
 }
-BOOLEAN_FLAGS = {"--begin", "--resume", "--abandon", "--finalize", "--preview", "--execute"}
+BOOLEAN_FLAGS = {"--begin", "--resume", "--abandon", "--finalize", "--finalize-reading", "--ingest-only", "--preview", "--execute"}
 SCHEMA_SHA256 = digest(SCHEMA)
 
 

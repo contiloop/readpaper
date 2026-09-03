@@ -487,7 +487,6 @@ class DesktopObserver:
                 "section_id",
                 "frame_index",
                 "frame_count",
-                "source_ranges",
                 "content_sha256",
                 "estimated_tokens",
                 "start_marker",

@@ -126,6 +126,31 @@ def test_figure_caption_is_not_a_section_heading() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "A simple baseline is used for comparison",
+        "I propose a simple alternative",
+        "V denotes the vocabulary size",
+    ],
+)
+def test_unpunctuated_letter_or_roman_prose_is_not_a_heading(line: str) -> None:
+    assert not is_heading_candidate(line, previous_blank=False, next_blank=False)
+
+
+def test_decimal_and_punctuated_appendix_headings_are_recognized() -> None:
+    assert is_heading_candidate(
+        "3.2 Training Objective",
+        previous_blank=True,
+        next_blank=True,
+    )
+    assert is_heading_candidate(
+        "A. Additional Results",
+        previous_blank=True,
+        next_blank=False,
+    )
+
+
 def test_large_section_uses_multiple_transport_frames_without_overlap() -> None:
     text = "A long methodological paragraph with evidence.\n\n" * 2_000
     artifact = artifact_id(text.encode())

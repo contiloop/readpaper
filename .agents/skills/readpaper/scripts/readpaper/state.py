@@ -18,6 +18,7 @@ from .models import (
     HostEventKind,
     HostLedgerState,
     RunEvent,
+    RunCompletionMode,
     RunSnapshot,
     RunState,
     ResponseAttemptStatus,
@@ -30,13 +31,14 @@ from .storage import FileLock, Layout, append_jsonl_once, atomic_write, atomic_w
 
 
 ACTIVE_STATES = {RunState.PREPARED, RunState.READING, RunState.REVIEWING, RunState.NEEDS_WORK}
-TERMINAL_STATES = {RunState.BLOCKED, RunState.COMPLETE}
+TERMINAL_STATES = {RunState.READ_COMPLETE, RunState.BLOCKED, RunState.COMPLETE}
 ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.PREPARED: {RunState.READING, RunState.NEEDS_WORK, RunState.PAUSED, RunState.BLOCKED},
     RunState.READING: {RunState.REVIEWING, RunState.NEEDS_WORK, RunState.PAUSED, RunState.BLOCKED},
-    RunState.REVIEWING: {RunState.NEEDS_WORK, RunState.COMPLETE, RunState.PAUSED, RunState.BLOCKED},
+    RunState.REVIEWING: {RunState.NEEDS_WORK, RunState.PAUSED, RunState.BLOCKED},
     RunState.NEEDS_WORK: {RunState.PREPARED, RunState.READING, RunState.REVIEWING, RunState.PAUSED, RunState.BLOCKED},
     RunState.PAUSED: {RunState.PREPARED, RunState.READING, RunState.REVIEWING},
+    RunState.READ_COMPLETE: set(),
     RunState.BLOCKED: set(),
     RunState.COMPLETE: set(),
 }
@@ -109,7 +111,14 @@ class StateService:
             self._recover_run(paper_id, run_id)
             return RunSnapshot.model_validate(read_json(self.layout.run_state(paper_id, run_id)))
 
-    def create_run(self, *, task_id: str, paper_id: str, bundle_id: str) -> RunSnapshot:
+    def create_run(
+        self,
+        *,
+        task_id: str,
+        paper_id: str,
+        bundle_id: str,
+        completion_mode: RunCompletionMode = RunCompletionMode.ANSWER_REQUIRED,
+    ) -> RunSnapshot:
         validate_id(paper_id, prefix="p", lengths=(64,))
         validate_id(bundle_id, prefix="b", lengths=(64,))
         with FileLock(self.layout.reference_lock), FileLock(self.layout.task_lock(task_id)):
@@ -139,14 +148,23 @@ class StateService:
                     break
             else:
                 raise ReadPaperError(ErrorCode.INTERNAL_ERROR, "could not allocate run ID")
-            snapshot = RunSnapshot(paper_id=paper_id, bundle_id=bundle_id, run_id=run_id, task_id=task_id)
+            snapshot = RunSnapshot(
+                paper_id=paper_id,
+                bundle_id=bundle_id,
+                run_id=run_id,
+                task_id=task_id,
+                completion_mode=completion_mode,
+            )
             event, after = self._plan_event(
                 snapshot,
                 event_kind=EventKind.RUN_CREATED,
                 subject_id=run_id,
                 result=EventResult.SUCCEEDED,
                 actor=Actor.STATE_SERVICE,
-                payload={"state": RunState.PREPARED.value},
+                payload={
+                    "state": RunState.PREPARED.value,
+                    "completion_mode": completion_mode.value,
+                },
                 idempotency_key=f"create:{run_id}",
             )
             self._commit_run(after, event)
@@ -181,8 +199,11 @@ class StateService:
                 raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "actor cannot transition run state")
             if to_state not in ALLOWED_TRANSITIONS[current.state]:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, f"transition {current.state}->{to_state} is forbidden")
-            if to_state is RunState.COMPLETE and actor is not Actor.HOOK:
-                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "only Stop hook may commit complete")
+            if to_state in {RunState.READ_COMPLETE, RunState.COMPLETE}:
+                raise ReadPaperError(
+                    ErrorCode.STATE_CONFLICT,
+                    "terminal reading state requires the dedicated finalization transaction",
+                )
             if current.state is RunState.PREPARED and to_state is RunState.READING and not current.scope_locked:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "scope must be locked before reading")
             resume_phase = current.resume_phase
@@ -222,6 +243,59 @@ class StateService:
             else:
                 binding = binding.model_copy(update={"active_run_id": None})
             self._write_binding(binding)
+            return event
+
+    def finalize_reading(
+        self,
+        *,
+        task_id: str,
+        paper_id: str,
+        run_id: str,
+        expected_event_seq: int,
+        authority_host_event_id: str,
+        committed_by_agent_execution_id: str,
+        client_request_id: str,
+    ) -> RunEvent:
+        """Commit paper-reading completion independently from any answer."""
+
+        with (
+            FileLock(self.layout.reference_lock),
+            FileLock(self.layout.task_lock(task_id)),
+            FileLock(self.layout.run_lock(run_id)),
+        ):
+            self._recover_run(paper_id, run_id)
+            run = RunSnapshot.model_validate(read_json(self.layout.run_state(paper_id, run_id)))
+            binding = self._read_binding(task_id)
+            if run.task_id != task_id or binding.current_run_id != run_id:
+                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "reading run is not current for task")
+            if run.event_seq != expected_event_seq:
+                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "run changed after the reading check")
+            if run.state is not RunState.REVIEWING:
+                raise ReadPaperError(
+                    ErrorCode.STATE_CONFLICT,
+                    "reading can finalize only after review",
+                )
+            changed = run.model_copy(update={"state": RunState.READ_COMPLETE})
+            event, after = self._plan_event(
+                changed,
+                event_kind=EventKind.READING_FINALIZED,
+                subject_id=run_id,
+                result=EventResult.SUCCEEDED,
+                actor=Actor.ROOT_MAIN,
+                payload={
+                    "run_from": run.state.value,
+                    "run_to": changed.state.value,
+                    "completion_mode": run.completion_mode.value,
+                    "authority_host_event_id": authority_host_event_id,
+                    "committed_by_agent_execution_id": committed_by_agent_execution_id,
+                },
+                idempotency_key=f"reading-finalize:{client_request_id}",
+                source_host_event_id=authority_host_event_id,
+                client_request_id=client_request_id,
+                agent_execution_id=committed_by_agent_execution_id,
+            )
+            self._commit_run(after, event)
+            self._write_binding(binding.model_copy(update={"active_run_id": None}))
             return event
 
     def lock_scope(
@@ -300,6 +374,11 @@ class StateService:
             binding = self._read_binding(task_id)
             if run.task_id != task_id or binding.current_run_id != run_id:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "answer run is not current for task")
+            if run.state not in {RunState.READ_COMPLETE, RunState.COMPLETE}:
+                raise ReadPaperError(
+                    ErrorCode.STATE_CONFLICT,
+                    "an answer can begin only after reading is complete",
+                )
             if binding.pending_answer_id is not None:
                 raise ReadPaperError(ErrorCode.ANSWER_PENDING, "task already has a pending answer")
             if binding.delivery_candidate_answer_id is not None:
@@ -410,10 +489,10 @@ class StateService:
                     ErrorCode.STATE_CONFLICT,
                     "run changed after the completion check",
                 )
-            if run.state not in {RunState.REVIEWING, RunState.COMPLETE}:
+            if run.state not in {RunState.READ_COMPLETE, RunState.COMPLETE}:
                 raise ReadPaperError(
                     ErrorCode.STATE_CONFLICT,
-                    "content can finalize only after review or on a completed run",
+                    "content can finalize only after reading is complete",
                 )
             response_id = answer["current_response_attempt_id"]
             if response_id != binding.current_response_attempt_id:
@@ -445,12 +524,7 @@ class StateService:
             )
             answers = dict(run.answers)
             answers[answer_id] = answer
-            changed = run.model_copy(
-                update={
-                    "answers": answers,
-                    "state": RunState.COMPLETE if run.state is RunState.REVIEWING else run.state,
-                }
-            )
+            changed = run.model_copy(update={"answers": answers})
             event, after = self._plan_event(
                 changed,
                 event_kind=EventKind.ANSWER_CONTENT_FINALIZED,
@@ -477,9 +551,7 @@ class StateService:
             self._write_binding(
                 binding.model_copy(
                     update={
-                        "active_run_id": (
-                            None if changed.state is RunState.COMPLETE else binding.active_run_id
-                        ),
+                        "active_run_id": binding.active_run_id,
                         "pending_answer_id": None,
                         "pending_answer_status": None,
                         "current_response_attempt_id": None,

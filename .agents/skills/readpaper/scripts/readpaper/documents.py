@@ -58,8 +58,14 @@ KNOWN_HEADINGS = {
     "appendix",
     "supplementary material",
 }
-NUMBERED_HEADING_RE = re.compile(
-    r"^\s*(?P<number>\d+(?:\.\d+)*|[IVXLC]+|[A-Z])[.)]?\s+(?P<title>\S.{0,160})\s*$"
+DECIMAL_HEADING_RE = re.compile(
+    r"^\s*(?P<number>\d+(?:\.\d+)*)[.)]?\s+(?P<title>\S.{0,160})\s*$"
+)
+ROMAN_HEADING_RE = re.compile(
+    r"^\s*(?P<number>[IVXLC]+)[.)]\s+(?P<title>\S.{0,160})\s*$"
+)
+LETTER_HEADING_RE = re.compile(
+    r"^\s*(?P<number>[A-Z])[.)]\s+(?P<title>\S.{0,160})\s*$"
 )
 APPENDIX_HEADING_RE = re.compile(
     r"^\s*(?:appendix|supplementary)\s*(?:[A-Z0-9]+)?(?:\s*[:.\-]\s*|\s+)?(.{0,160})$",
@@ -76,6 +82,14 @@ REJECT_HEADING_PREFIXES = (
     "proof.",
 )
 HEADING_SCORE_THRESHOLD = 5
+
+
+def _numbered_heading_match(line: str) -> re.Match[str] | None:
+    for pattern in (DECIMAL_HEADING_RE, ROMAN_HEADING_RE, LETTER_HEADING_RE):
+        match = pattern.fullmatch(line)
+        if match is not None:
+            return match
+    return None
 
 
 def estimate_tokens(text: str) -> int:
@@ -192,11 +206,9 @@ def heading_score(line: str, *, previous_blank: bool, next_blank: bool) -> int:
     score = 0
     if normalized.rstrip(":") in KNOWN_HEADINGS:
         score += 6
-    numbered = NUMBERED_HEADING_RE.fullmatch(stripped)
+    numbered = _numbered_heading_match(stripped)
     if numbered is not None:
-        prefix = numbered.group("number")
-        if prefix[:1].isdigit() or not stripped.endswith("."):
-            score += 5
+        score += 5
     if APPENDIX_HEADING_RE.fullmatch(stripped):
         score += 6
     if previous_blank:
@@ -247,7 +259,7 @@ def _repeated_header_footer_lines(pages: Sequence[PageText]) -> set[str]:
 
 
 def _heading_level(line: str) -> int:
-    match = NUMBERED_HEADING_RE.fullmatch(" ".join(line.split()))
+    match = _numbered_heading_match(" ".join(line.split()))
     if match is None:
         return 1
     number = match.group("number")
@@ -258,7 +270,7 @@ def _heading_level(line: str) -> int:
 
 def _normalized_heading_title(line: str) -> str:
     stripped = " ".join(line.split()).rstrip(":")
-    numbered = NUMBERED_HEADING_RE.fullmatch(stripped)
+    numbered = _numbered_heading_match(stripped)
     if numbered is not None:
         stripped = numbered.group("title")
     return stripped.casefold()
@@ -268,7 +280,7 @@ def _heading_method(line: str) -> Literal["known_heading", "numbered_heading", "
     normalized = " ".join(line.split()).casefold().rstrip(":")
     if normalized in KNOWN_HEADINGS or APPENDIX_HEADING_RE.fullmatch(line):
         return "known_heading"
-    if NUMBERED_HEADING_RE.fullmatch(" ".join(line.split())):
+    if _numbered_heading_match(" ".join(line.split())):
         return "numbered_heading"
     return "text_heuristic"
 

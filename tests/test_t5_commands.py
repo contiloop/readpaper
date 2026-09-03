@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from reportlab.pdfgen import canvas
 
 from readpaper.authority import bound_request_document
 from readpaper.canonical import digest, digest_text
-from readpaper.commands import CommandRuntime
-from readpaper.models import Actor, EventKind, EventResult, HostEventKind
+from readpaper.commands import CommandRuntime, TOOL_OUTPUT_TOKEN_LIMIT
+from readpaper.documents import estimate_tokens
+from readpaper.errors import ErrorCode, ReadPaperError
+from readpaper.models import Actor, EventKind, EventResult, HostEventKind, RunState
 from readpaper.ids import sequence_id
 from readpaper.parse_invocation import Invocation, parse_argv
 
@@ -20,7 +23,13 @@ def pdf(path: Path) -> None:
     document.save()
 
 
-def authorized(runtime: CommandRuntime, argv: list[str], *, tool: int) -> dict:
+def authorized(
+    runtime: CommandRuntime,
+    argv: list[str],
+    *,
+    tool: int,
+    turn_id: str = "turn-1",
+) -> dict:
     invocation = parse_argv(argv)
     assert invocation is not None
     client = str(invocation.flags["--client-request-id"])
@@ -32,7 +41,7 @@ def authorized(runtime: CommandRuntime, argv: list[str], *, tool: int) -> dict:
         hook_definition_hash="h" * 64,
         task_id=str(invocation.flags.get("--task-id", "task")),
         session_id="session",
-        turn_id="turn-1",
+        turn_id=turn_id,
         tool_use_id=f"tool-{tool}",
         agent_id="root",
         agent_execution_id="ae_" + f"{tool:064x}",
@@ -42,7 +51,9 @@ def authorized(runtime: CommandRuntime, argv: list[str], *, tool: int) -> dict:
     return json.loads(runtime.execute(invocation))
 
 
-def test_prepare_scope_read_without_answer_render_and_check_contract(tmp_path: Path) -> None:
+def test_prepare_scope_read_without_answer_render_and_check_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime = CommandRuntime(tmp_path)
     runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
     runtime.state.append_host_event(
@@ -111,9 +122,24 @@ def test_prepare_scope_read_without_answer_render_and_check_contract(tmp_path: P
     assert read["data"]["content"].startswith("<readpaper-section ")
     assert "[PDF PAGE 1]" in read["data"]["content"]
     assert read["data"]["frame"]["frame_id"] == frame_id
+    assert "source_ranges" not in read["data"]["frame"]
     assert read["data"]["tool_use_id"] == "tool-4"
+    assert estimate_tokens(json.dumps(read, ensure_ascii=False)) <= TOOL_OUTPUT_TOKEN_LIMIT
 
-    begun = authorized(
+    monkeypatch.setattr(
+        "readpaper.commands.estimate_tokens",
+        lambda _: TOOL_OUTPUT_TOKEN_LIMIT + 1,
+    )
+    oversized = authorized(
+        runtime,
+        ["read", run_id, "--frame-id", frame_id, "--client-request-id", "cr_" + "8" * 32],
+        tool=8,
+    )
+    assert oversized["ok"] is False
+    assert oversized["error"]["code"] == ErrorCode.OUTPUT_BUDGET_EXCEEDED.value
+    monkeypatch.undo()
+
+    begun_too_early = authorized(
         runtime,
         [
             "answer", run_id, "--begin", "--task-id", "task", "--user-turn-id", "turn-1",
@@ -121,7 +147,8 @@ def test_prepare_scope_read_without_answer_render_and_check_contract(tmp_path: P
         ],
         tool=5,
     )
-    assert begun["data"]["answer_status"] == "drafting"
+    assert begun_too_early["ok"] is False
+    assert begun_too_early["error"]["code"] == ErrorCode.STATE_CONFLICT.value
 
     rendered = authorized(
         runtime,
@@ -157,7 +184,7 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         runtime,
         [
             "prepare", str(source), "--task-id", "task", "--user-turn-id", "turn-ready",
-            "--client-request-id", "cr_" + "6" * 32,
+            "--client-request-id", "cr_" + "6" * 32, "--ingest-only",
         ],
         tool=10,
     )
@@ -216,8 +243,69 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         version_id="note-v1",
         payload={"content_sha256": "a" * 64},
     )
+    runtime.state.transition(
+        task_id="task",
+        paper_id=prepared["paper_id"],
+        run_id=run_id,
+        to_state=RunState.REVIEWING,
+        actor=Actor.ROOT_MAIN,
+        reason_code="understanding_note_recorded",
+    )
     monkeypatch.setattr("readpaper.commands.content_audit_stage_returned", lambda *args, **kwargs: True)
     checked = json.loads(runtime.execute(parse_argv(["check", run_id])))
     assert checked["data"]["answer_id"] is None
     assert checked["data"]["decision"] == "reading_ready"
-    assert checked["data"]["full_source_currently_resident"] is True
+    assert checked["data"]["all_source_frames_emitted_in_current_epoch"] is True
+
+    finalized = authorized(
+        runtime,
+        [
+            "run", run_id, "--finalize-reading", "--task-id", "task",
+            "--user-turn-id", "turn-ready", "--client-request-id", "cr_" + "9" * 32,
+        ],
+        tool=12,
+        turn_id="turn-ready",
+    )
+    assert finalized["data"]["run_state"] == "read_complete"
+    assert finalized["data"]["completion_mode"] == "ingest_only"
+    assert finalized["data"]["active_run_released"] is True
+    binding = runtime.state.get_binding("task")
+    assert binding.active_run_id is None
+    assert binding.current_run_id == run_id
+
+    runtime.state.append_host_event(
+        task_id="task",
+        event_kind=HostEventKind.USER_TURN_STARTED,
+        semantic_key="user-turn-follow-up",
+        subject_id="turn-follow-up",
+        payload={"prompt_sha256": digest_text("explain it"), "byte_length": 10},
+    )
+    begun = authorized(
+        runtime,
+        [
+            "answer", run_id, "--begin", "--task-id", "task",
+            "--user-turn-id", "turn-follow-up", "--client-request-id", "cr_" + "a" * 32,
+        ],
+        tool=13,
+        turn_id="turn-follow-up",
+    )
+    assert begun["data"]["answer_status"] == "drafting"
+
+
+def test_schema_v1_inventory_requires_explicit_local_state_migration(tmp_path: Path) -> None:
+    runtime = CommandRuntime(tmp_path)
+    paper = "p_" + "1" * 64
+    bundle = "b_" + "2" * 64
+    run = runtime.state.create_run(task_id="task", paper_id=paper, bundle_id=bundle)
+    inventory = runtime.state.layout.run_dir(paper, run.run_id) / "inventory.json"
+    inventory.write_text(json.dumps({
+        "schema_version": 1,
+        "paper_id": paper,
+        "bundle_id": bundle,
+        "run_id": run.run_id,
+    }))
+    with pytest.raises(ReadPaperError) as error:
+        runtime.execute(parse_argv(["check", run.run_id]))
+    assert error.value.code is ErrorCode.SCHEMA_MIGRATION_REQUIRED
+    assert error.value.details["detected_schema_version"] == 1
+    assert error.value.details["recovery_command"].startswith("mv .readpaper ")

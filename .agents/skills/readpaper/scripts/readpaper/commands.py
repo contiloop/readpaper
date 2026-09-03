@@ -1,4 +1,4 @@
-"""Command adapter for the eight ReadPaper P0 commands."""
+"""Command adapter for the ReadPaper workflow commands."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .archives import inspect_zip
 from .deletion import DeletionService
 from .documents import (
     TRANSPORT_FRAME_TOKEN_LIMIT,
+    estimate_tokens,
     extract_pdf,
     extract_text,
     materialize_frame,
@@ -29,7 +30,17 @@ from .documents import (
 )
 from .errors import ErrorCode, ReadPaperError
 from .ids import artifact_id, artifact_ref_id, bundle_id, paper_id, sequence_id
-from .models import AnswerStatus, Actor, EventKind, EventResult, RecordKind, RunState, ScopeKind, utc_now
+from .models import (
+    AnswerStatus,
+    Actor,
+    EventKind,
+    EventResult,
+    RecordKind,
+    RunCompletionMode,
+    RunState,
+    ScopeKind,
+    utc_now,
+)
 from .parse_invocation import Invocation
 from .sources import MediaKind, classify_media, discover_landing, fetch_public_url, local_source_token, normalize_url
 from .state import StateService
@@ -64,6 +75,13 @@ ROOT_WRITABLE_RECORDS = {
     "user_pause", "answer_grounding",
 }
 REVIEWER_WRITABLE_RECORDS = {"audit_result", "flow_result"}
+
+PINNED_MODEL = "gpt-5.6-sol"
+MODEL_CONTEXT_WINDOW = 272_000
+AUTO_COMPACT_TOKEN_LIMIT = 230_000
+SOURCE_RESIDENCY_TOKEN_LIMIT = 150_000
+NON_SOURCE_CONTEXT_RESERVE = AUTO_COMPACT_TOKEN_LIMIT - SOURCE_RESIDENCY_TOKEN_LIMIT
+TOOL_OUTPUT_TOKEN_LIMIT = 65_536
 
 
 class CommandRuntime:
@@ -107,14 +125,17 @@ class CommandRuntime:
 
     def _scope_key(self, invocation: Invocation) -> str:
         client = str(invocation.flags["--client-request-id"])
-        if invocation.command in {"prepare", "answer", "resume", "delete"}:
+        if invocation.command in {"prepare", "run", "answer", "resume", "delete"}:
             return ":".join(
                 [str(invocation.flags.get("--task-id")), invocation.command, self._mode(invocation), client]
             )
         return ":".join([invocation.positional[0], invocation.command, client])
 
     def _mode(self, invocation: Invocation) -> str:
-        for value in ("--begin", "--resume", "--abandon", "--finalize", "--preview", "--execute"):
+        for value in (
+            "--begin", "--resume", "--abandon", "--finalize", "--finalize-reading",
+            "--ingest-only", "--preview", "--execute",
+        ):
             if value in invocation.flags:
                 return value.removeprefix("--")
         return "default"
@@ -252,7 +273,17 @@ class CommandRuntime:
             elif record["media_kind"] == MediaKind.TEXT:
                 documents.append((record, extract_text(artifact_data, bundle_id=bundle, artifact_ref_id=record["artifact_ref_id"], artifact_id=record["artifact_id"])))
         task_id = str(invocation.flags["--task-id"])
-        run = self.state.create_run(task_id=task_id, paper_id=paper, bundle_id=bundle)
+        completion_mode = (
+            RunCompletionMode.INGEST_ONLY
+            if "--ingest-only" in invocation.flags
+            else RunCompletionMode.ANSWER_REQUIRED
+        )
+        run = self.state.create_run(
+            task_id=task_id,
+            paper_id=paper,
+            bundle_id=bundle,
+            completion_mode=completion_mode,
+        )
         manifest = {
             "schema_version": 2,
             "paper_id": paper,
@@ -286,6 +317,8 @@ class CommandRuntime:
         emitted_text_tokens = sum(int(item["estimated_tokens"]) for item in all_frames)
         transport_overhead_tokens = max(0, emitted_text_tokens - paper_text_tokens)
         estimated_total_source_tokens = paper_text_tokens + transport_overhead_tokens
+        estimated_visual_tokens = len(visual_units) * 2_000
+        estimated_scope_tokens = estimated_total_source_tokens + estimated_visual_tokens + 4_000
         inventory = {
             "schema_version": 2,
             "paper_id": paper,
@@ -327,6 +360,7 @@ class CommandRuntime:
                 "bundle_id": bundle,
                 "run_id": run.run_id,
                 "task_id": task_id,
+                "completion_mode": completion_mode.value,
                 "proposed_scope_kind": "full",
                 "scope_locked": False,
                 "artifacts": artifact_records,
@@ -334,23 +368,31 @@ class CommandRuntime:
                 "transport_frames": [{**item, "content": None} for item in all_frames],
                 "visual_units": visual_units,
                 "page_counts": {record["artifact_ref_id"]: len(extracted.pages) for record, extracted in documents if record["media_kind"] == MediaKind.PDF},
-                "paper_input_estimate": estimated_total_source_tokens,
+                "paper_input_estimate": estimated_scope_tokens,
                 "artifact_exclusion_estimates": [],
                 "limits_applied": {
                     "pdf_pages": 200,
                     "semantic_unit": "section",
                     "transport_frame_tokens": TRANSPORT_FRAME_TOKEN_LIMIT,
-                    "tool_output_tokens": 65_536,
-                    "auto_compact_tokens": 850_000,
+                    "tool_output_tokens": TOOL_OUTPUT_TOKEN_LIMIT,
+                    "model": PINNED_MODEL,
+                    "model_context_tokens": MODEL_CONTEXT_WINDOW,
+                    "auto_compact_tokens": AUTO_COMPACT_TOKEN_LIMIT,
+                    "source_residency_tokens": SOURCE_RESIDENCY_TOKEN_LIMIT,
                 },
                 "residency_plan": {
                     "strategy": "full_source_section_stream",
                     "paper_text_tokens": paper_text_tokens,
                     "transport_overhead_tokens": transport_overhead_tokens,
                     "estimated_total_source_tokens": estimated_total_source_tokens,
-                    "target_auto_compact_limit": 850_000,
-                    "context_reserve_tokens": 200_000,
-                    "estimated_to_fit": estimated_total_source_tokens <= 650_000,
+                    "estimated_visual_tokens": estimated_visual_tokens,
+                    "fixed_workflow_reserve_tokens": 4_000,
+                    "estimated_scope_tokens": estimated_scope_tokens,
+                    "model": PINNED_MODEL,
+                    "model_context_tokens": MODEL_CONTEXT_WINDOW,
+                    "target_auto_compact_limit": AUTO_COMPACT_TOKEN_LIMIT,
+                    "non_source_context_reserve_tokens": NON_SOURCE_CONTEXT_RESERVE,
+                    "estimated_to_fit": estimated_scope_tokens <= SOURCE_RESIDENCY_TOKEN_LIMIT,
                 },
                 "warnings": [warning for _, extracted in documents for page in extracted.pages for warning in page.warnings],
                 "scope_limitations": [],
@@ -360,16 +402,35 @@ class CommandRuntime:
     def _inventory(self, run_id: str) -> tuple[dict[str, Any], Any]:
         for path in self.state.layout.papers.glob(f"p_*/runs/{run_id}/inventory.json"):
             inventory = read_json(path)
+            schema_version = int(inventory.get("schema_version", 0))
+            if schema_version != 2:
+                raise ReadPaperError(
+                    ErrorCode.SCHEMA_MIGRATION_REQUIRED,
+                    "local run inventory predates section/frame schema 2",
+                    details={
+                        "detected_schema_version": schema_version,
+                        "required_schema_version": 2,
+                        "recovery": "archive .readpaper from the repository root, then start a new run",
+                        "recovery_command": (
+                            'mv .readpaper ".readpaper-schema-v1-backup-'
+                            '$(date +%Y%m%d-%H%M%S)"'
+                        ),
+                    },
+                )
             return inventory, self.state.get_run(inventory["paper_id"], run_id)
         raise ReadPaperError(ErrorCode.NOT_FOUND, "run inventory not found")
 
     def _read(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
-        if int(inventory.get("schema_version", 0)) != 2:
-            raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "read requires inventory schema 2")
         if not run.scope_locked:
             raise ReadPaperError(ErrorCode.STATE_CONFLICT, "reading scope must be locked before source emission")
-        if run.state not in {RunState.READING, RunState.REVIEWING, RunState.NEEDS_WORK, RunState.COMPLETE}:
+        if run.state not in {
+            RunState.READING,
+            RunState.REVIEWING,
+            RunState.NEEDS_WORK,
+            RunState.READ_COMPLETE,
+            RunState.COMPLETE,
+        }:
             raise ReadPaperError(ErrorCode.STATE_CONFLICT, f"source cannot be read while run is {run.state.value}")
         binding = self.state.get_binding(run.task_id)
         frame_id = str(invocation.flags["--frame-id"])
@@ -398,7 +459,14 @@ class CommandRuntime:
                     "detection_method", "detection_confidence",
                 )
             },
-            "frame": frame,
+            "frame": {
+                key: frame[key]
+                for key in (
+                    "frame_id", "section_id", "frame_index", "frame_count",
+                    "content_sha256", "estimated_tokens", "start_marker",
+                    "middle_marker", "end_marker",
+                )
+            },
             "content": content,
             "next_frame_id": next_frame_id,
             "invocation_capability_id": capability["capability_id"],
@@ -413,7 +481,19 @@ class CommandRuntime:
             "context_epoch": capability["context_epoch"],
             "session_epoch": binding.session_epoch,
         }
-        return self._success("read", run.paper_id, run.bundle_id, run.run_id, data)
+        response = self._success("read", run.paper_id, run.bundle_id, run.run_id, data)
+        serialized_tokens = estimate_tokens(self._encode(response).decode("utf-8"))
+        if serialized_tokens > TOOL_OUTPUT_TOKEN_LIMIT:
+            raise ReadPaperError(
+                ErrorCode.OUTPUT_BUDGET_EXCEEDED,
+                "serialized read response exceeds the configured tool output limit",
+                details={
+                    "estimated_tokens": serialized_tokens,
+                    "tool_output_token_limit": TOOL_OUTPUT_TOKEN_LIMIT,
+                    "frame_id": frame_id,
+                },
+            )
+        return response
 
     def _render(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
@@ -528,8 +608,11 @@ class CommandRuntime:
             selected_frames = [item for item in inventory["frames"] if item["section_id"] in selected_section_ids]
             selected_visuals = [item for item in inventory["visual_units"] if item["artifact_ref_id"] in required_set]
             estimate = sum(int(item["estimated_tokens"]) for item in selected_frames) + len(selected_visuals) * 2000 + 4000
-            if estimate > 650_000:
-                raise ReadPaperError(ErrorCode.OUTPUT_BUDGET_EXCEEDED, "locked scope exceeds the 650,000-token residency estimate")
+            if estimate > SOURCE_RESIDENCY_TOKEN_LIMIT:
+                raise ReadPaperError(
+                    ErrorCode.OUTPUT_BUDGET_EXCEEDED,
+                    f"locked scope exceeds the {SOURCE_RESIDENCY_TOKEN_LIMIT:,}-token residency estimate",
+                )
             disclosure = ""
             if scope_kind is ScopeKind.USER_REDUCED:
                 lines = ["> ReadPaper 범위 제한: 다음 자료는 제외되어 이 답변은 요청 범위만 다룹니다."]
@@ -707,8 +790,6 @@ class CommandRuntime:
 
     def _check(self, invocation: Invocation, capability: None) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
-        if int(inventory.get("schema_version", 0)) != 2:
-            raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "check requires inventory schema 2")
         binding = self.state.get_binding(run.task_id)
         required_refs = (
             set(run.required_artifact_ref_ids)
@@ -777,7 +858,7 @@ class CommandRuntime:
         blockers = []
         if not run.scope_locked:
             blockers.append("scope_not_locked")
-        if run.state is RunState.COMPLETE:
+        if run.state in {RunState.READ_COMPLETE, RunState.COMPLETE}:
             blockers.extend(missing_historical_frames)
             blockers.extend(missing_historical_visuals)
         else:
@@ -957,11 +1038,19 @@ class CommandRuntime:
         }:
             decision = "ready_to_finalize_content"
         elif answer_id is None:
-            decision = "reading_ready"
+            decision = (
+                "reading_complete"
+                if run.state in {RunState.READ_COMPLETE, RunState.COMPLETE}
+                else "reading_ready"
+            )
         else:
             decision = "allow"
         data = {
             "run_state": run.state.value,
+            "completion_mode": run.completion_mode.value,
+            "run_requires_user_facing_answer": (
+                run.completion_mode is RunCompletionMode.ANSWER_REQUIRED
+            ),
             "scope_kind": run.scope_kind.value,
             "interpretation_state": run.interpretation_state.value,
             "decision": decision,
@@ -1000,7 +1089,7 @@ class CommandRuntime:
             "missing_resident_section_ids": missing_resident_section_ids,
             "missing_historical_visual_unit_ids": missing_historical_visuals,
             "missing_resident_visual_unit_ids": missing_resident_visuals,
-            "full_source_currently_resident": not missing_resident_frames,
+            "all_source_frames_emitted_in_current_epoch": not missing_resident_frames,
             "pending_audit_ids": pending_audits,
             "pending_finding_ids": [],
             "invalid_agent_execution_ids": sorted(invalid_agent_execution_ids),
@@ -1028,6 +1117,60 @@ class CommandRuntime:
             "user_facing_completion_label": None,
         }
         return self._success("check", run.paper_id, run.bundle_id, run.run_id, data)
+
+    def _run(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
+        _, run = self._inventory(invocation.positional[0])
+        task_id = str(invocation.flags["--task-id"])
+        if task_id != run.task_id or capability["task_id"] != task_id:
+            raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "run finalization belongs to another task")
+        checked = self._check(Invocation(command="check", positional=(run.run_id,), flags={}), None)
+        check_data = checked["data"]
+        if check_data["decision"] != "reading_ready":
+            raise ReadPaperError(
+                ErrorCode.STATE_CONFLICT,
+                "reading still has completion blockers",
+                details={
+                    "decision": check_data["decision"],
+                    "blocking_ids": check_data["blocking_ids"],
+                },
+            )
+        authority = self.state.find_user_turn(
+            task_id=task_id,
+            turn_or_event_id=str(invocation.flags["--user-turn-id"]),
+        )
+        binding = self.state.get_binding(task_id)
+        if (
+            authority.subject_id != capability["turn_id"]
+            or capability["session_id"] != binding.session_id
+        ):
+            raise ReadPaperError(
+                ErrorCode.OBSERVER_UNAVAILABLE,
+                "reading finalization is not bound to the observed current user turn",
+            )
+        event = self.state.finalize_reading(
+            task_id=task_id,
+            paper_id=run.paper_id,
+            run_id=run.run_id,
+            expected_event_seq=int(check_data["checked_event_seq"]),
+            authority_host_event_id=authority.host_event_id,
+            committed_by_agent_execution_id=capability["agent_execution_id"],
+            client_request_id=str(invocation.flags["--client-request-id"]),
+        )
+        after = self.state.get_run(run.paper_id, run.run_id)
+        return self._success(
+            "run",
+            run.paper_id,
+            run.bundle_id,
+            run.run_id,
+            {
+                "run_state": after.state.value,
+                "completion_mode": after.completion_mode.value,
+                "active_run_released": self.state.get_binding(task_id).active_run_id is None,
+                "event_id": event.event_id,
+                "checked_event_seq": check_data["checked_event_seq"],
+                "client_request_id": invocation.flags["--client-request-id"],
+            },
+        )
 
     def _answer(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         _, run = self._inventory(invocation.positional[0])

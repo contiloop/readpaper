@@ -16,6 +16,7 @@ BUNDLE = bundle_id(schema_version=1, paper_id=PAPER, landing_url=None, artifacts
 
 def begin(service: StateService, task: str = "task") -> tuple[str, str, str]:
     run = service.create_run(task_id=task, paper_id=PAPER, bundle_id=BUNDLE)
+    make_reviewable(service, run.run_id, task=task)
     answer = service.begin_answer(
         task_id=task,
         paper_id=PAPER,
@@ -30,7 +31,7 @@ def begin(service: StateService, task: str = "task") -> tuple[str, str, str]:
     return run.run_id, answer["answer_id"], answer["current_response_attempt_id"]
 
 
-def make_reviewable(service: StateService, run_id: str) -> None:
+def make_reviewable(service: StateService, run_id: str, *, task: str = "task") -> None:
     service.lock_scope(
         paper_id=PAPER,
         run_id=run_id,
@@ -40,12 +41,22 @@ def make_reviewable(service: StateService, run_id: str) -> None:
         authority_event_id="hev_" + "9" * 64,
     )
     service.transition(
-        task_id="task", paper_id=PAPER, run_id=run_id,
+        task_id=task, paper_id=PAPER, run_id=run_id,
         to_state=RunState.READING, actor=Actor.ROOT_MAIN, reason_code="scope_locked",
     )
     service.transition(
-        task_id="task", paper_id=PAPER, run_id=run_id,
+        task_id=task, paper_id=PAPER, run_id=run_id,
         to_state=RunState.REVIEWING, actor=Actor.ROOT_MAIN, reason_code="note_recorded",
+    )
+    current = service.get_run(PAPER, run_id)
+    service.finalize_reading(
+        task_id=task,
+        paper_id=PAPER,
+        run_id=run_id,
+        expected_event_seq=current.event_seq,
+        authority_host_event_id="hev_" + "8" * 64,
+        committed_by_agent_execution_id="ae_" + "8" * 64,
+        client_request_id="cr_" + "8" * 32,
     )
 
 
@@ -126,17 +137,9 @@ def test_answer_abandon_is_the_only_explicit_pending_clear(tmp_path: Path) -> No
     assert stored["attempts"][response_id]["status"] == ResponseAttemptStatus.ABANDONED.value
 
 
-def test_new_run_is_blocked_while_answer_pending_even_if_run_paused(tmp_path: Path) -> None:
+def test_new_run_is_blocked_while_answer_pending(tmp_path: Path) -> None:
     service = StateService(tmp_path)
-    run_id, _, _ = begin(service)
-    service.transition(
-        task_id="task",
-        paper_id=PAPER,
-        run_id=run_id,
-        to_state=RunState.PAUSED,
-        actor=Actor.USER,
-        reason_code="pause",
-    )
+    begin(service)
     with pytest.raises(ReadPaperError) as error:
         service.create_run(task_id="task", paper_id=paper_id(b"other"), bundle_id=BUNDLE)
     assert error.value.code is ErrorCode.ANSWER_PENDING
@@ -145,7 +148,6 @@ def test_new_run_is_blocked_while_answer_pending_even_if_run_paused(tmp_path: Pa
 def test_content_completion_is_independent_from_delivery_and_does_not_block_next_answer(tmp_path: Path) -> None:
     service = StateService(tmp_path)
     run_id, answer_id, response_id = begin(service)
-    make_reviewable(service, run_id)
     current = service.get_run(PAPER, run_id)
     service.finalize_answer_content(
         task_id="task",
@@ -163,7 +165,7 @@ def test_content_completion_is_independent_from_delivery_and_does_not_block_next
     assert binding.pending_answer_id is None
     assert binding.delivery_candidate_answer_id == answer_id
     assert binding.delivery_candidate_status == "pending_observation"
-    assert service.get_run(PAPER, run_id).state is RunState.COMPLETE
+    assert service.get_run(PAPER, run_id).state is RunState.READ_COMPLETE
     stored = service.get_run(PAPER, run_id).answers[answer_id]
     assert stored["answer_status"] == AnswerStatus.CONTENT_FINALIZED.value
     assert stored["attempts"][response_id]["status"] == ResponseAttemptStatus.CONTENT_FINALIZED.value
@@ -185,10 +187,48 @@ def test_content_completion_is_independent_from_delivery_and_does_not_block_next
     assert previous["attempts"][response_id]["status"] == ResponseAttemptStatus.DELIVERY_UNKNOWN.value
 
 
+def test_read_complete_releases_active_run_and_keeps_current_run(tmp_path: Path) -> None:
+    service = StateService(tmp_path)
+    run = service.create_run(task_id="task", paper_id=PAPER, bundle_id=BUNDLE)
+    service.lock_scope(
+        paper_id=PAPER,
+        run_id=run.run_id,
+        scope_kind=ScopeKind.FULL,
+        required_artifact_ref_ids=[],
+        excluded_artifacts=[],
+        authority_event_id="hev_" + "7" * 64,
+    )
+    service.transition(
+        task_id="task", paper_id=PAPER, run_id=run.run_id,
+        to_state=RunState.READING, actor=Actor.ROOT_MAIN, reason_code="scope_locked",
+    )
+    service.transition(
+        task_id="task", paper_id=PAPER, run_id=run.run_id,
+        to_state=RunState.REVIEWING, actor=Actor.ROOT_MAIN, reason_code="note_recorded",
+    )
+    current = service.get_run(PAPER, run.run_id)
+    service.finalize_reading(
+        task_id="task", paper_id=PAPER, run_id=run.run_id,
+        expected_event_seq=current.event_seq,
+        authority_host_event_id="hev_" + "8" * 64,
+        committed_by_agent_execution_id="ae_" + "8" * 64,
+        client_request_id="cr_" + "8" * 32,
+    )
+    binding = service.get_binding("task")
+    assert service.get_run(PAPER, run.run_id).state is RunState.READ_COMPLETE
+    assert binding.active_run_id is None
+    assert binding.current_run_id == run.run_id
+    next_run = service.create_run(
+        task_id="task",
+        paper_id=paper_id(b"another paper"),
+        bundle_id=BUNDLE,
+    )
+    assert service.get_binding("task").active_run_id == next_run.run_id
+
+
 def test_stop_delivery_upgrades_only_delivery_metadata(tmp_path: Path) -> None:
     service = StateService(tmp_path)
     run_id, answer_id, response_id = begin(service)
-    make_reviewable(service, run_id)
     current = service.get_run(PAPER, run_id)
     service.finalize_answer_content(
         task_id="task", paper_id=PAPER, run_id=run_id, answer_id=answer_id,

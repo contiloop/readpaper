@@ -21,10 +21,16 @@ class RunState(StrEnum):
     PREPARED = "prepared"
     READING = "reading"
     REVIEWING = "reviewing"
+    READ_COMPLETE = "read_complete"
     NEEDS_WORK = "needs_work"
     PAUSED = "paused"
     BLOCKED = "blocked"
     COMPLETE = "complete"
+
+
+class RunCompletionMode(StrEnum):
+    ANSWER_REQUIRED = "answer_required"
+    INGEST_ONLY = "ingest_only"
 
 
 class ScopeKind(StrEnum):
@@ -189,6 +195,7 @@ class EventKind(StrEnum):
     FINDING_RECORDED = "finding_recorded"
     FINDING_DISPOSITIONED = "finding_dispositioned"
     NOTE_VERSIONED = "note_versioned"
+    READING_FINALIZED = "reading_finalized"
     DRAFT_VERSIONED = "draft_versioned"
     FLOW_AUDIT_STARTED = "flow_audit_started"
     FLOW_RESULT_RECORDED = "flow_result_recorded"
@@ -256,6 +263,7 @@ class RunSnapshot(StrictModel):
     run_id: str
     task_id: str
     state: RunState = RunState.PREPARED
+    completion_mode: RunCompletionMode = RunCompletionMode.ANSWER_REQUIRED
     resume_phase: RunState | None = None
     scope_kind: ScopeKind = ScopeKind.FULL
     interpretation_state: InterpretationState = InterpretationState.NONE

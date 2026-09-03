@@ -10,7 +10,16 @@ from typing import Any
 from .canonical import canonical_bytes, digest, digest_text
 from .commands import CommandRuntime
 from .errors import ErrorCode, ReadPaperError
-from .models import AnswerStatus, EventKind, EventResult, HostEventKind, ResponseAttemptStatus, RunState, utc_now
+from .models import (
+    AnswerStatus,
+    EventKind,
+    EventResult,
+    HostEventKind,
+    ResponseAttemptStatus,
+    RunCompletionMode,
+    RunState,
+    utc_now,
+)
 from .ids import sequence_id
 from .parse_invocation import Invocation
 from .state import StateService
@@ -62,6 +71,7 @@ class StopCoordinator:
                 if binding.active_run_id
                 or binding.pending_answer_id
                 or binding.delivery_candidate_answer_id
+                or self._initial_answer_required(binding)
                 else None
             )
         session = payload.get("session_id")
@@ -71,9 +81,29 @@ class StopCoordinator:
                 binding.get("active_run_id")
                 or binding.get("pending_answer_id")
                 or binding.get("delivery_candidate_answer_id")
+                or self._initial_answer_required(self.state.get_binding(str(binding["task_id"])))
             ):
                 return str(binding["task_id"])
         return None
+
+    def _initial_answer_required(self, binding: Any) -> bool:
+        if binding.current_run_id is None or binding.current_paper_id is None:
+            return False
+        try:
+            run = self.state.get_run(binding.current_paper_id, binding.current_run_id)
+        except ReadPaperError:
+            return False
+        if (
+            run.state is not RunState.READ_COMPLETE
+            or run.completion_mode is not RunCompletionMode.ANSWER_REQUIRED
+        ):
+            return False
+        terminal = {
+            AnswerStatus.CONTENT_FINALIZED.value,
+            AnswerStatus.SENT_VERIFIED.value,
+            AnswerStatus.DELIVERY_UNKNOWN.value,
+        }
+        return not any(answer.get("answer_status") in terminal for answer in run.answers.values())
 
     def handle_stop(self, payload: dict[str, Any]) -> bytes:
         if payload.get("stop_hook_active") is True or payload.get("agent_id") is not None:
@@ -138,11 +168,12 @@ class StopCoordinator:
                 task_id=task_id,
                 turn_id=str(turn),
             )
-            if data.get("decision") in {"block", "ready_to_finalize_content"} and repair is not None:
+            repairable_decisions = {"block", "reading_ready", "ready_to_finalize_content"}
+            if data.get("decision") in repairable_decisions and repair is not None:
                 target = (
                     "content_finalize"
                     if data.get("decision") == "ready_to_finalize_content"
-                    else ("run" if blockers else "answer")
+                    else ("run" if blockers or data.get("decision") == "reading_ready" else "answer")
                 )
                 count = binding.run_auto_resume_count if target == "run" else binding.answer_auto_resume_counts.get(str(binding.pending_answer_id), 0)
                 if count < 1:
@@ -162,16 +193,41 @@ class StopCoordinator:
                     self._consume_budget(task_id, target, answer_id)
                     atomic_write_json(path, transaction, replace=False)
                     return output
-            # Non-repairable blockers and exhausted budgets must not loop.
-            if data.get("decision") in {"block", "ready_to_finalize_content"}:
-                output = _encoded({})
+            if (
+                data.get("decision") == "reading_complete"
+                and answer_id is None
+                and data.get("run_requires_user_facing_answer") is True
+            ):
+                reason = (
+                    "ReadPaper reading is complete, but this run requires a user-facing answer. "
+                    "Call answer --begin, draft and ground the response, pass check --answer-id, "
+                    "and finalize the answer before sending it."
+                )
+                output = _encoded({"decision": "block", "reason": reason})
+                transaction.update({
+                    "status": "completed",
+                    "attempt_status": "not_started",
+                    "target": "answer",
+                    "exact_output_hex": output.hex(),
+                })
+                atomic_write_json(path, transaction, replace=False)
+                return output
+            # A blocker must stay a Stop-level block even when automatic repair
+            # is unavailable or its one-shot budget has been consumed.
+            if data.get("decision") in repairable_decisions:
+                reason = (
+                    "ReadPaper completion is still blocked. Resolve these items and run check again: "
+                    + ", ".join(str(item) for item in blockers or [data.get("decision")])
+                )
+                output = _encoded({"decision": "block", "reason": reason})
                 transaction.update({"status": "completed", "attempt_status": "not_started", "target": "external", "exact_output_hex": output.hex()})
                 atomic_write_json(path, transaction, replace=False)
                 return output
-            self.state.commit_stop_delivery(
-                task_id=task_id, paper_id=paper_id, run_id=run_id,
-                assistant_message_hash=digest_text(message), authority_host_event_id=host.host_event_id,
-            )
+            if binding.delivery_candidate_answer_id is not None:
+                self.state.commit_stop_delivery(
+                    task_id=task_id, paper_id=paper_id, run_id=run_id,
+                    assistant_message_hash=digest_text(message), authority_host_event_id=host.host_event_id,
+                )
             output = _encoded({})
             transaction.update({"status": "completed", "attempt_status": "completed", "target": "delivery", "exact_output_hex": output.hex()})
             atomic_write_json(path, transaction, replace=False)
@@ -226,14 +282,29 @@ class StopCoordinator:
         task_id: str,
         turn_id: str,
     ) -> tuple[str, str] | None:
-        # Stop continuations repair an answer attempt, not answer-independent
-        # ingestion. Scope locking and answer creation require observed user
-        # authority and cannot be synthesized by a Stop continuation.
-        if check.get("answer_id") is None or "scope_not_locked" in (check.get("blocking_ids") or []):
+        blockers = check.get("blocking_ids") or []
+        if "scope_not_locked" in blockers:
             return None
         client = "cr_" + secrets.token_hex(16)
         prefix = [str((self.root / ".venv/bin/python").absolute()), str((self.root / ".agents/skills/readpaper/scripts/paper.py").absolute())]
-        if check.get("decision") == "ready_to_finalize_content":
+        missing_text = check.get("missing_resident_frame_ids") or []
+        if missing_text:
+            tokens = prefix + ["read", run_id, "--frame-id", str(missing_text[0]), "--client-request-id", client]
+            return _quote(tokens), client
+        missing_visual = check.get("missing_resident_visual_unit_ids") or []
+        if missing_visual:
+            tokens = prefix + ["render", run_id, "--unit-id", str(missing_visual[0]), "--client-request-id", client]
+            return _quote(tokens), client
+        if check.get("decision") == "reading_ready":
+            tokens = prefix + [
+                "run", run_id, "--finalize-reading", "--task-id", task_id,
+                "--user-turn-id", turn_id, "--client-request-id", client,
+            ]
+            return _quote(tokens), client
+        if (
+            check.get("answer_id") is not None
+            and check.get("decision") == "ready_to_finalize_content"
+        ):
             tokens = prefix + [
                 "answer",
                 run_id,
@@ -247,14 +318,6 @@ class StopCoordinator:
                 "--client-request-id",
                 client,
             ]
-            return _quote(tokens), client
-        missing_text = check.get("missing_resident_frame_ids") or []
-        if missing_text:
-            tokens = prefix + ["read", run_id, "--frame-id", str(missing_text[0]), "--client-request-id", client]
-            return _quote(tokens), client
-        missing_visual = check.get("missing_resident_visual_unit_ids") or []
-        if missing_visual:
-            tokens = prefix + ["render", run_id, "--unit-id", str(missing_visual[0]), "--client-request-id", client]
             return _quote(tokens), client
         return None
 

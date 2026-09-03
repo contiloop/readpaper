@@ -14,7 +14,7 @@ def quote_all(words: list[str]) -> str:
     return " ".join("'" + word.replace("'", "'\"'\"'") + "'" for word in words)
 
 
-def test_all_eight_command_grammars_parse() -> None:
+def test_all_command_grammars_parse() -> None:
     client = "cr_" + "1" * 32
     valid = [
         ["prepare", "/tmp/p.pdf", "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],
@@ -22,6 +22,7 @@ def test_all_eight_command_grammars_parse() -> None:
         ["render", "run_" + "1" * 32, "--unit-id", "visual", "--client-request-id", client],
         ["record", "run_" + "1" * 32, "--kind", "printed_label", "--payload", "/tmp/p.json", "--client-request-id", client],
         ["check", "run_" + "1" * 32],
+        ["run", "run_" + "1" * 32, "--finalize-reading", "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],
         ["answer", "run_" + "1" * 32, "--begin", "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],
         ["answer", "run_" + "1" * 32, "--finalize", "--answer-id", "ans_" + "2" * 64, "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],
         ["resume", "run_" + "1" * 32, "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],

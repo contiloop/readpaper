@@ -10,7 +10,7 @@ from readpaper.canonical import digest, digest_text
 from readpaper.authority import bound_request_document
 from readpaper.audits import AuditStage, ContentRole, reserve_content_audit
 from readpaper.commands import CommandRuntime
-from readpaper.models import Actor, HostEventKind, RunState
+from readpaper.models import Actor, HostEventKind, RunCompletionMode, RunState, ScopeKind
 from readpaper.observer import DesktopObserver
 from readpaper.parse_invocation import parse_argv
 from readpaper.stop import StopCoordinator
@@ -54,7 +54,6 @@ def prepared_run(tmp_path: Path) -> tuple[CommandRuntime, dict, str, str]:
     make_pdf(source)
     prepared = execute_authorized(runtime, ["prepare", str(source), "--task-id", "task", "--user-turn-id", "turn-0", "--client-request-id", "cr_" + "1" * 32], "bootstrap-prepare")
     run_id = prepared["run_id"]
-    execute_authorized(runtime, ["answer", run_id, "--begin", "--task-id", "task", "--user-turn-id", "turn-0", "--client-request-id", "cr_" + "2" * 32], "bootstrap-answer")
     ref = prepared["data"]["artifacts"][0]["artifact_ref_id"]
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir(mode=0o700)
@@ -161,7 +160,7 @@ def test_previous_epoch_frames_remain_historical_but_not_resident(tmp_path: Path
     assert checked["data"]["resident_coverage"]["frames"] == 0
     assert checked["data"]["missing_historical_frame_ids"] == []
     assert checked["data"]["missing_resident_frame_ids"] == [frame_id]
-    assert checked["data"]["full_source_currently_resident"] is False
+    assert checked["data"]["all_source_frames_emitted_in_current_epoch"] is False
 
 
 def test_pretool_allows_canonical_read_only_check_without_capability(tmp_path: Path) -> None:
@@ -533,7 +532,7 @@ def test_stop_transaction_replays_exact_bytes_and_pretool_claims_once(tmp_path: 
     assert json.loads(observer.pre_tool(duplicate))["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
-def test_stop_never_synthesizes_read_before_answer_and_scope(tmp_path: Path) -> None:
+def test_stop_blocks_without_synthesizing_read_before_scope_lock(tmp_path: Path) -> None:
     runtime = CommandRuntime(tmp_path)
     runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
     runtime.state.append_host_event(
@@ -569,7 +568,9 @@ def test_stop_never_synthesizes_read_before_answer_and_scope(tmp_path: Path) -> 
         "last_assistant_message": "The live run must restart from a fresh user turn.",
     })
 
-    assert json.loads(output) == {}
+    blocked = json.loads(output)
+    assert blocked["decision"] == "block"
+    assert "scope_not_locked" in blocked["reason"]
     binding = runtime.state.get_binding("task")
     assert binding.run_auto_resume_count == 0
     transaction = next(
@@ -580,6 +581,112 @@ def test_stop_never_synthesizes_read_before_answer_and_scope(tmp_path: Path) -> 
     assert transaction["target"] == "external"
     assert transaction["expected_command_sha256"] is None
     assert runtime.state.get_run(prepared["paper_id"], prepared["run_id"]).state is RunState.PREPARED
+
+
+def test_stop_repairs_missing_frame_without_an_answer(tmp_path: Path) -> None:
+    runtime, prepared, frame_id, _ = prepared_run(tmp_path)
+    output = StopCoordinator(tmp_path).handle_stop({
+        "hook_event_name": "Stop",
+        "session_id": "session",
+        "turn_id": "turn-2",
+        "cwd": str(tmp_path),
+        "stop_hook_active": False,
+        "last_assistant_message": "incomplete report",
+    })
+    blocked = json.loads(output)
+    assert blocked["decision"] == "block"
+    command = blocked["reason"].splitlines()[-1]
+    assert "'read'" in command
+    assert frame_id in command
+
+
+def test_stop_blocks_answer_required_read_complete_without_answer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime, prepared, _, _ = prepared_run(tmp_path)
+    runtime.state.transition(
+        task_id="task", paper_id=prepared["paper_id"], run_id=prepared["run_id"],
+        to_state=RunState.REVIEWING, actor=Actor.ROOT_MAIN, reason_code="note_recorded",
+    )
+    current = runtime.state.get_run(prepared["paper_id"], prepared["run_id"])
+    runtime.state.finalize_reading(
+        task_id="task", paper_id=prepared["paper_id"], run_id=prepared["run_id"],
+        expected_event_seq=current.event_seq,
+        authority_host_event_id="hev_" + "6" * 64,
+        committed_by_agent_execution_id="ae_" + "6" * 64,
+        client_request_id="cr_" + "6" * 32,
+    )
+
+    monkeypatch.setattr(
+        CommandRuntime,
+        "execute",
+        lambda self, invocation: json.dumps({
+            "data": {
+                "decision": "reading_complete",
+                "blocking_ids": [],
+                "answer_id": None,
+                "run_requires_user_facing_answer": True,
+                "finalized_content_sha256": None,
+            }
+        }).encode(),
+    )
+    output = StopCoordinator(tmp_path).handle_stop({
+        "hook_event_name": "Stop",
+        "session_id": "session",
+        "turn_id": "turn-3",
+        "cwd": str(tmp_path),
+        "stop_hook_active": False,
+        "last_assistant_message": "unfinalized report",
+    })
+    blocked = json.loads(output)
+    assert blocked["decision"] == "block"
+    assert "requires a user-facing answer" in blocked["reason"]
+
+
+def test_stop_allows_ingest_only_read_complete_without_answer(tmp_path: Path) -> None:
+    runtime = CommandRuntime(tmp_path)
+    run = runtime.state.create_run(
+        task_id="task",
+        paper_id="p_" + "1" * 64,
+        bundle_id="b_" + "2" * 64,
+        completion_mode=RunCompletionMode.INGEST_ONLY,
+    )
+    runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
+    runtime.state.lock_scope(
+        paper_id=run.paper_id,
+        run_id=run.run_id,
+        scope_kind=ScopeKind.FULL,
+        required_artifact_ref_ids=[],
+        excluded_artifacts=[],
+        authority_event_id="hev_" + "1" * 64,
+    )
+    runtime.state.transition(
+        task_id="task", paper_id=run.paper_id, run_id=run.run_id,
+        to_state=RunState.READING, actor=Actor.ROOT_MAIN, reason_code="scope_locked",
+    )
+    runtime.state.transition(
+        task_id="task", paper_id=run.paper_id, run_id=run.run_id,
+        to_state=RunState.REVIEWING, actor=Actor.ROOT_MAIN, reason_code="note_recorded",
+    )
+    current = runtime.state.get_run(run.paper_id, run.run_id)
+    runtime.state.finalize_reading(
+        task_id="task", paper_id=run.paper_id, run_id=run.run_id,
+        expected_event_seq=current.event_seq,
+        authority_host_event_id="hev_" + "2" * 64,
+        committed_by_agent_execution_id="ae_" + "2" * 64,
+        client_request_id="cr_" + "2" * 32,
+    )
+
+    output = StopCoordinator(tmp_path).handle_stop({
+        "hook_event_name": "Stop",
+        "task_id": "task",
+        "session_id": "session",
+        "turn_id": "turn-ingest-only",
+        "cwd": str(tmp_path),
+        "stop_hook_active": False,
+        "last_assistant_message": "Reading complete.",
+    })
+    assert json.loads(output) == {}
 
 
 def test_user_prompt_cancels_reserved_continuation_and_nested_stop_never_blocks(tmp_path: Path) -> None:
