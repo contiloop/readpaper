@@ -1,0 +1,23 @@
+[project]
+name = "readpaper"
+version = "0.0.0"
+description = "Local-first paper reading support for Codex Desktop"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=11.3,<13",
+    "pydantic>=2.11,<3",
+    "pypdf>=6,<7",
+    "tiktoken>=0.11,<1",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.138,<7",
+    "pytest>=8.4,<10",
+    "reportlab>=4.4,<5",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = [".agents/skills/readpaper/scripts"]
+testpaths = ["tests"]

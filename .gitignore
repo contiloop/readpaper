@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+*.py[cod]
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+.omo/
+
+# Local ReadPaper products and live-run state. The workflow code is public;
+# paper contents, generated reports, evidence bundles, and machine-specific
+# hook wiring stay local.
+/reports/
+/evidence/
+/.codex/hooks.json
+/.dryforge/handoff.md
+/.dryforge/wiring-manifest.json
+
+# BEGIN READPAPER MANAGED
+/papers/
+/.readpaper/
+# END READPAPER MANAGED

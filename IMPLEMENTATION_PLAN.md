@@ -1,8 +1,8 @@
 # ReadPaper 구현 계획 — Codex 내부형 MVP
 
-작성: 2026-08-28. 상태: 설계 제안 / 구현 미착수.
+작성: 2026-08-28. 상태: 역사적 설계 문서 / 구현은 `.agents/skills/readpaper`와 `.codex`에 있음.
 
-기준: [PROJECT_GOAL.md](/Users/inertia/Desktop/readpaper/PROJECT_GOAL.md).
+기준: [PROJECT_GOAL.md](PROJECT_GOAL.md).
 이 문서는 실행 코드가 아니다. 명령·파일·검사 예시는 앞으로 만들 인터페이스다.
 
 ## 1. 결정할 방향
@@ -141,12 +141,16 @@ Main이 검토 결과의 원문 위치를 다시 열어 수용·기각·미해�
 Python 안에서 모델 API를 부르는 것도, `SKILL.md`가 실행을 전환하는 것도 아니다.
 공식 문서에 정의된 동작이지만, 실제 사용하는 Desktop 버전에서 먼저 시험해야 한다.
 [Codex Stop hook](https://learn.chatgpt.com/docs/hooks#stop).
+아래 one-use/CAS 항목은 구현·인수 목표이며 현재 통과 증거가 아니다. 정적 schema 검사는 callback ID 없이 필요한 입력을 구성할 수 있는지만 확인하고, 실제 continuation과 authorized effect의 at-most-once는 새 Desktop session의 live G0가 별도로 증명한다.
 
 Hook 설계 조건:
 
-- 현재 session에 활성화된 ReadPaper run이 있을 때만 작동한다. 일반 대화나 다른 논문의 작업을 막지 않는다.
-- 초기 MVP는 세션당 활성 논문 1개로 시작한다. 다른 session의 상태와 섞지 않는다.
+- durable ReadPaper-local task binding에 활성화된 run이 있을 때만 작동한다. host session은 관측 metadata이며 일반 대화나 다른 논문의 작업을 막지 않는다.
+- 초기 MVP는 Codex 작업당 활성 논문 1개로 시작한다. 다른 local task/session의 상태와 섞지 않는다.
 - MVP의 자동 재개는 run 단위로 최대 1회다. 재개된 Main은 그 안에서 여러 도구를 호출할 수 있지만, 또 종료할 때 미완료이면 경고와 `continue:false`로 중단한다.
+- Codex가 callback별 고유 ID를 제공한다고 가정하지 않는다. local task ID와 Stop 입력의 session/turn, 현재 run/response attempt, root actor, hook definition hash로 immutable logical Stop slot을 만든다. mutable 재개 counter와 검사 결과는 최초 transaction 안에 snapshot하고 CAS로 재개 권한을 한 번만 예약한다. exact assistant-message hash는 같은 slot의 byte-exact payload 충돌 검사에 사용한다.
+- host가 같은 continuation prompt를 두 번 만들 가능성까지 제거했다고 주장하지 않는다. reason에 넣은 attempt ID와 nonce를 다음 `UserPromptSubmit`에서 one-use claim하여 실제 보완 작업의 상태 변경과 protected tool 권한은 최대 한 번만 허용한다.
+- SessionStart는 required `source`를 보존한다. `source=compact`는 matching context-stream compaction으로 처리하고 새 Desktop session recovery를 실행하지 않는다. tool/compact hook의 optional `agent_id`/`agent_type`은 root와 subagent stream 구분에 사용한다.
 - `stop_hook_active=true`이면 새 `decision:block`을 내지 않는다. 재검사가 성공하면 종료를 허용하고, 실패하면 미완료로 중단한다. 새 run을 만들어 제한을 초기화하지 않는다.
 - 사용자 취소·범위 변경·외부 접근 문제는 자동 재개 사유에서 제외한다.
 - 검사 오류를 성공으로 바꾸지 않는다. 다만 host가 hook을 건너뛰거나 실패를 계속 처리할 수 있으므로 hook을 보안 경계나 절대적 강제로 표현하지 않는다.
@@ -180,10 +184,10 @@ compaction/재개 이후에는 작업 노트가 원문을 대체하지 않는다
 
 ## 4. 기록은 최소한으로, 의미는 정확하게
 
-제안 파일 구조의 루트는 `/Users/inertia/Desktop/readpaper`다. 아래는 생성 예정이며 현재 구현 파일은 없다.
+제안 파일 구조의 루트는 프로젝트 루트다. 아래 구조는 초기 설계 당시의 목표 형태다.
 
 ```text
-/Users/inertia/Desktop/readpaper/
+readpaper/
   PROJECT_GOAL.md
   IMPLEMENTATION_PLAN.md
   AGENTS.md                              지속적인 출처·안전 규칙
@@ -296,8 +300,8 @@ Main과 각 subagent 역할의 모델·reasoning effort는 별도로 선택할 �
 
 1. **원문 전달 시험:** 10쪽 테스트 PDF의 각 페이지 앞·중간·끝에 표식, 그림·표에 별도 값을 넣는다. Main에게 정답표를 주지 않고 전체 텍스트·이미지를 전달한다. 재열람 없는 확인 질문과 실제 도구 결과를 검사한다. 이는 전달 경로의 smoke test이지 이해의 증명이 아니다.
 2. **잘림 실패 시험:** 일부러 작은 출력 예산을 사용한다. 중간 생략·끝 생략·한 페이지 내 잘림을 성공으로 기록하지 않아야 한다.
-3. **Hook 재개 시험:** 실제 운영할 Codex 앱에서 프로젝트 hook을 사용자 검토 후 활성화한다. 시험 누락 1개를 만든 뒤 Stop→Python JSON→같은 Main의 추가 도구 호출을 관측한다. CLI만 통과하면 Desktop 통과라고 하지 않는다.
-4. **반복 방지 시험:** 고칠 수 없는 누락을 두고 1회 재개 상한, 사용자 취소, 일반 대화에서의 비활성화를 확인한다.
+3. **Hook 재개 시험:** 실제 운영할 Codex 앱에서 프로젝트 hook을 사용자 검토 후 활성화한다. 시험 누락 1개를 만든 뒤 Stop→Python JSON→nonce가 일치하는 continuation→같은 Main의 추가 도구 호출을 관측한다. CLI만 통과하면 Desktop 통과라고 하지 않는다.
+4. **반복 방지 시험:** 동일 Stop 입력 재전송과 중복 continuation prompt를 주입해 one-use nonce claim과 상태 변경이 한 번만 성공하는지 확인한다. 고칠 수 없는 누락의 1회 재개 상한, `stop_hook_active=true`, 사용자 취소, 일반 대화에서의 비활성화도 확인한다.
 5. **압축 시험:** 시험용 작업에서 압축 이벤트가 관측되는지, 이후 원문 유지 상태가 미확인으로 바뀌는지 확인한다. 현재 사용자 전역 설정은 시험 대상으로 바꾸지 않는다.
 
 Hook 시험이 실패하면 수동 도구 검사형 prototype만 가능하다고 명시한다. 자동 재개 기능을 구현 완료라고 하지 않는다.
@@ -314,7 +318,7 @@ P0–P2의 구체적 수용 시나리오:
 | P0 텍스트/이미지 전달 | fixture에 `pdftotext -f 1 -l 10`, `pdftoppm -png` 실행 후 Main이 모든 텍스트와 이미지를 실제 도구로 받음 | 페이지별 앞·중간·끝 표식과 시각 값 응답을 숨긴 정답과 대조; 반환된 도구 본문·이미지 호출 이력 보관 |
 | P0 잘림 | 같은 출력에 `exec_command.max_output_tokens`를 의도적으로 작게 지정; 중간/끝 생략 표본도 시험 | 잘린 범위를 정상 전달로 인정하지 않음; 관측 불가라면 `unknown`; 원 출력과 수신 결과 비교 |
 | P0 actor 구분 | Main은 1–5쪽, subagent만 6–10쪽을 열고 검사 | Main의 6–10쪽은 누락 또는 `unknown`; subagent 결과로 Main 완료 판정 금지 |
-| P0 Stop 재개 | 시험 누락 1개를 둔 채 Main 종료 → hook stdout의 JSON과 이어지는 도구 호출 관찰 | 같은 Main 재개 1회 확인; 누락을 남기면 두 번째 종료에서 중단; `stop_hook_active`와 run 재개 횟수 기록 |
+| P0 Stop 재개 | 시험 누락 1개를 둔 채 Main 종료 → hook stdout의 JSON, nonce-matching continuation과 이어지는 도구 호출 관찰 | 같은 Main의 authorized repair 1회 확인; 동일 Stop/reason replay와 중복 prompt에서도 one-use claim·상태 효과는 한 번만 성공; 누락을 남기면 두 번째 종료에서 중단; `stop_hook_active`와 run 재개 횟수 기록 |
 | P0 취소/관측 실패 | 재개 중 중단 후 일반 질문, hook 신뢰 해제, 시험 timeout을 각각 수행 | 일반 질문을 강제로 독해에 돌려보내지 않음; 관측 실패를 성공으로 표시하지 않음 |
 | P0 압축 | 시험용 작업에서 수동 compact 또는 시험 임계값으로 압축 유도 | 압축 관측 및 유지 상태 변경 확인; CLI 결과와 Desktop 결과를 구분해 기록 |
 | P1 CLI 기본 | `paper.py prepare <fixture>` → `read <paper-id> --run-id <run-id> --pdf-pages 1-10` → `render` → 이미지 열기 → `check <run-id>` | 원본 해시 불변, 정확한 10페이지 산출물, 누락 없는 원문 범위, 정확한 페이지 재열람; 수동 확인과 자동 관측을 구별 |
