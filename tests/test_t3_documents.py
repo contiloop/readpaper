@@ -7,7 +7,13 @@ from pydantic import ValidationError
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
-from readpaper.documents import extract_pdf, render_pdf_page
+from readpaper.documents import (
+    extract_pdf,
+    extract_text,
+    is_heading_candidate,
+    materialize_source_ranges,
+    render_pdf_page,
+)
 from readpaper.ids import artifact_id, artifact_ref_id, bundle_id, paper_id
 from readpaper.locators import PdfObjectLocator, PdfPageLocator, TextSpanLocator, bbox_to_ppm
 
@@ -28,7 +34,7 @@ def identities(data: bytes) -> tuple[str, str, str, str]:
     artifact = artifact_id(data)
     ref = artifact_ref_id(role="main", source_token="local")
     bundle = bundle_id(
-        schema_version=1,
+        schema_version=2,
         paper_id=paper,
         landing_url=None,
         artifacts=[{"artifact_ref_id": ref, "artifact_id": artifact}],
@@ -41,14 +47,23 @@ def test_ten_page_extraction_preserves_every_page_and_marker(tmp_path: Path) -> 
     _, artifact, ref, bundle = identities(data)
     result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
     assert len(result.pages) == 10
-    assert {unit.pdf_page for unit in result.units} == set(range(1, 11))
+    assert result.sections
+    assert result.frames
     for page in result.pages:
-        joined = "".join(unit.content for unit in result.units if unit.pdf_page == page.pdf_page)
+        ranges = sorted(
+            (
+                source_range
+                for section in result.sections
+                for source_range in section.source_ranges
+                if source_range.pdf_page == page.pdf_page
+            ),
+            key=lambda item: item.char_start,
+        )
+        joined = "".join(page.text[item.char_start:item.char_end] for item in ranges)
         assert joined == page.text
         assert f"PAGE-{page.pdf_page}-START" in joined
         assert f"PAGE-{page.pdf_page}-END" in joined
-    assert all(unit.estimated_tokens <= 4_000 for unit in result.units)
-    assert all(len(batch.unit_ids) <= 8 and batch.estimated_tokens <= 12_000 for batch in result.batches)
+    assert all(frame.estimated_tokens <= 48_000 for frame in result.frames)
 
 
 def test_empty_page_is_not_silently_treated_as_text_coverage(tmp_path: Path) -> None:
@@ -60,7 +75,82 @@ def test_empty_page_is_not_silently_treated_as_text_coverage(tmp_path: Path) -> 
     _, artifact, ref, bundle = identities(data)
     result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
     assert result.pages[0].warnings == ("empty_text",)
-    assert result.units == ()
+    assert result.sections == ()
+    assert result.frames == ()
+
+
+def test_numbered_headings_create_nonoverlapping_logical_sections(tmp_path: Path) -> None:
+    path = tmp_path / "headings.pdf"
+    document = canvas.Canvas(str(path), pagesize=letter)
+    y = 740
+    for heading in (
+        "Abstract",
+        "1 Introduction",
+        "2 Related Work",
+        "3 Method",
+        "3.1 Architecture",
+        "4 Experiments",
+        "5 Conclusion",
+        "References",
+    ):
+        document.drawString(72, y, heading)
+        y -= 24
+        document.drawString(72, y, f"Body for {heading}")
+        y -= 36
+    document.showPage()
+    document.save()
+    data = path.read_bytes()
+    _, artifact, ref, bundle = identities(data)
+    result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
+    titles = [section.title for section in result.sections]
+    assert "1 Introduction" in titles
+    assert "3 Method" in titles
+    assert "3.1 Architecture" in titles
+    assert "References" in titles
+    method = next(section for section in result.sections if section.title == "3 Method")
+    architecture = next(section for section in result.sections if section.title == "3.1 Architecture")
+    assert architecture.parent_section_id == method.section_id
+    reconstructed = "".join(
+        result.pages[0].text[item.char_start:item.char_end]
+        for section in result.sections
+        for item in section.source_ranges
+    )
+    assert reconstructed == result.pages[0].text
+
+
+def test_figure_caption_is_not_a_section_heading() -> None:
+    assert not is_heading_candidate(
+        "Figure 3. Accuracy on the validation set.",
+        previous_blank=True,
+        next_blank=True,
+    )
+
+
+def test_large_section_uses_multiple_transport_frames_without_overlap() -> None:
+    text = "A long methodological paragraph with evidence.\n\n" * 2_000
+    artifact = artifact_id(text.encode())
+    ref = artifact_ref_id(role="supplementary", source_token="large.txt")
+    bundle = bundle_id(
+        schema_version=2,
+        paper_id="p_" + "1" * 64,
+        landing_url=None,
+        artifacts=[{"artifact_ref_id": ref, "artifact_id": artifact}],
+    )
+    result = extract_text(
+        text.encode(),
+        bundle_id=bundle,
+        artifact_ref_id=ref,
+        artifact_id=artifact,
+        frame_token_limit=400,
+    )
+    assert len(result.sections) == 1
+    assert len(result.frames) > 1
+    assert all(frame.estimated_tokens <= 400 for frame in result.frames)
+    reconstructed = "".join(
+        materialize_source_ranges(result.pages, frame.source_ranges, include_page_markers=False)
+        for frame in result.frames
+    )
+    assert reconstructed == text
 
 
 def test_pdf_render_uses_cropbox_and_records_pixel_identity(tmp_path: Path) -> None:
