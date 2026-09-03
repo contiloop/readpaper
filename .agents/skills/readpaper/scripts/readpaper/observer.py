@@ -395,6 +395,25 @@ class DesktopObserver:
                 return value
         return None
 
+    def _inventory_for_envelope(self, envelope: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+        run_id = envelope.get("run_id")
+        paper_id = envelope.get("paper_id")
+        bundle_id = envelope.get("bundle_id")
+        if not all(isinstance(value, str) for value in (run_id, paper_id, bundle_id)):
+            raise ReadPaperError(ErrorCode.ID_MISMATCH, "read response lacks inventory identity")
+        path = self.state.layout.run_dir(str(paper_id), str(run_id)) / "inventory.json"
+        if not path.is_file():
+            raise ReadPaperError(ErrorCode.NOT_FOUND, "read response inventory is missing")
+        inventory = read_json(path)
+        if (
+            int(inventory.get("schema_version", 0)) != 2
+            or inventory.get("paper_id") != paper_id
+            or inventory.get("bundle_id") != bundle_id
+            or inventory.get("run_id") != run_id
+        ):
+            raise ReadPaperError(ErrorCode.ID_MISMATCH, "read response identity differs from inventory")
+        return inventory, self.state.get_run(str(paper_id), str(run_id))
+
     @staticmethod
     def _response_envelope(tool_response: Any) -> dict[str, Any] | None:
         candidates: list[str] = []
@@ -444,20 +463,56 @@ class DesktopObserver:
         )
         if success and invocation.command == "read":
             data = envelope.get("data")
-            if isinstance(data, dict) and isinstance(data.get("units"), list):
-                for unit in data["units"]:
-                    if not isinstance(unit, dict) or not isinstance(unit.get("unit_id"), str) or not isinstance(unit.get("content"), str):
-                        continue
-                    self.state.append_event(
-                        paper_id=str(envelope["paper_id"]), run_id=str(envelope["run_id"]),
-                        event_kind=EventKind.UNIT_EMITTED, subject_id=unit["unit_id"], result=EventResult.SUCCEEDED,
-                        actor=Actor.ROOT_MAIN,
-                        payload={"content_sha256": digest_text(unit["content"]), "complete": True, "capability_id": capability["capability_id"]},
-                        idempotency_key=f"posttool:{tool_use}:unit:{unit['unit_id']}", source_host_event_id=host.host_event_id,
-                        client_request_id=capability["client_request_id"], session_id=capability["session_id"], turn_id=capability["turn_id"],
-                        agent_id=None, agent_execution_id=capability["agent_execution_id"], context_stream_id=capability["context_stream_id"],
-                        context_epoch=int(capability["context_epoch"]), tool_use_id=tool_use,
-                    )
+            if not isinstance(data, dict):
+                return b""
+            frame = data.get("frame")
+            content = data.get("content")
+            if not isinstance(frame, dict) or not isinstance(content, str):
+                return b""
+            frame_id = frame.get("frame_id")
+            if not isinstance(frame_id, str):
+                return b""
+            try:
+                inventory, _ = self._inventory_for_envelope(envelope)
+            except ReadPaperError:
+                return b""
+            expected = next((item for item in inventory["frames"] if item["frame_id"] == frame_id), None)
+            if expected is None:
+                return b""
+            actual_hash = digest_text(content)
+            if actual_hash != expected["content_sha256"]:
+                return b""
+            immutable_fields = (
+                "frame_id",
+                "section_id",
+                "frame_index",
+                "frame_count",
+                "source_ranges",
+                "content_sha256",
+                "estimated_tokens",
+                "start_marker",
+                "middle_marker",
+                "end_marker",
+            )
+            if any(frame.get(field) != expected.get(field) for field in immutable_fields):
+                return b""
+            self.state.append_event(
+                paper_id=str(envelope["paper_id"]), run_id=str(envelope["run_id"]),
+                event_kind=EventKind.SOURCE_FRAME_EMITTED, subject_id=frame_id, result=EventResult.SUCCEEDED,
+                actor=Actor.ROOT_MAIN,
+                payload={
+                    "section_id": expected["section_id"],
+                    "frame_index": expected["frame_index"],
+                    "frame_count": expected["frame_count"],
+                    "content_sha256": actual_hash,
+                    "complete": True,
+                    "capability_id": capability["capability_id"],
+                },
+                idempotency_key=f"posttool:{tool_use}:frame:{frame_id}", source_host_event_id=host.host_event_id,
+                client_request_id=capability["client_request_id"], session_id=capability["session_id"], turn_id=capability["turn_id"],
+                agent_id=None, agent_execution_id=capability["agent_execution_id"], context_stream_id=capability["context_stream_id"],
+                context_epoch=int(capability["context_epoch"]), tool_use_id=tool_use,
+            )
         return b""
 
     def _observe_visual_open(self, payload: dict[str, Any]) -> bytes:

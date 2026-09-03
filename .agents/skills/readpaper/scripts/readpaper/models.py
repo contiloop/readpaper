@@ -172,7 +172,7 @@ class EventKind(StrEnum):
     SOURCE_PREPARED = "source_prepared"
     SESSION_STARTED = "session_started"
     USER_TURN_STARTED = "user_turn_started"
-    UNIT_EMITTED = "unit_emitted"
+    SOURCE_FRAME_EMITTED = "source_frame_emitted"
     RENDER_CREATED = "render_created"
     VISUAL_OPEN_OBSERVED = "visual_open_observed"
     COMPACT_STARTED = "compact_started"

@@ -18,7 +18,7 @@ def test_all_eight_command_grammars_parse() -> None:
     client = "cr_" + "1" * 32
     valid = [
         ["prepare", "/tmp/p.pdf", "--task-id", "task", "--user-turn-id", "turn", "--client-request-id", client],
-        ["read", "run_" + "1" * 32, "--unit-id", "unit", "--client-request-id", client],
+        ["read", "run_" + "1" * 32, "--frame-id", "rf_" + "2" * 64, "--client-request-id", client],
         ["render", "run_" + "1" * 32, "--unit-id", "visual", "--client-request-id", client],
         ["record", "run_" + "1" * 32, "--kind", "printed_label", "--payload", "/tmp/p.json", "--client-request-id", client],
         ["check", "run_" + "1" * 32],
@@ -35,8 +35,9 @@ def test_all_eight_command_grammars_parse() -> None:
     "words",
     [
         ["read", "run", "--client-request-id", "cr_" + "1" * 32],
-        ["read", "run", "--unit-id", "a", "--unit-id", "b", "--client-request-id", "cr_" + "1" * 32],
-        ["read", "run", "--unit-id", "a", "--unknown", "b", "--client-request-id", "cr_" + "1" * 32],
+        ["read", "run", "--frame-id", "rf_a", "--frame-id", "rf_b", "--client-request-id", "cr_" + "1" * 32],
+        ["read", "run", "--frame-id", "rf_a", "--unknown", "b", "--client-request-id", "cr_" + "1" * 32],
+        ["read", "run", "--frame-id", "not-a-frame", "--client-request-id", "cr_" + "1" * 32],
         ["answer", "run", "--begin", "--resume", "--task-id", "t", "--user-turn-id", "u", "--client-request-id", "cr_" + "1" * 32],
         ["delete", "paper", "--execute", "--task-id", "t", "--user-turn-id", "u", "--client-request-id", "cr_" + "1" * 32],
     ],

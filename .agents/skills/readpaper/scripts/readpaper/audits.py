@@ -56,7 +56,7 @@ def reserve_content_audit(
         "reviewer_agent_id": None,
         "reviewer_synthesis_epoch": None,
         "status": "requested",
-        "read_unit_ids": [],
+        "read_frame_ids": [],
         "opened_visual_unit_ids": [],
         "unverified_scope": [],
         "findings": [],

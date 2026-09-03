@@ -19,7 +19,14 @@ from .audits import (
 from .canonical import canonical_bytes, digest, digest_text
 from .archives import inspect_zip
 from .deletion import DeletionService
-from .documents import extract_pdf, extract_text, render_image, render_pdf_page
+from .documents import (
+    TRANSPORT_FRAME_TOKEN_LIMIT,
+    extract_pdf,
+    extract_text,
+    materialize_frame,
+    render_image,
+    render_pdf_page,
+)
 from .errors import ErrorCode, ReadPaperError
 from .ids import artifact_id, artifact_ref_id, bundle_id, paper_id, sequence_id
 from .models import AnswerStatus, Actor, EventKind, EventResult, RecordKind, RunState, ScopeKind, utc_now
@@ -227,7 +234,7 @@ class CommandRuntime:
                     "failure_code": None if supported else ErrorCode.UNSUPPORTED_ARTIFACT.value,
                 })
                 artifact_bytes[member_artifact] = member_data
-        bundle = bundle_id(schema_version=1, paper_id=paper, landing_url=landing_url, artifacts=artifact_records)
+        bundle = bundle_id(schema_version=2, paper_id=paper, landing_url=landing_url, artifacts=artifact_records)
         object_paths: dict[str, str] = {}
         for artifact_key, artifact_data in artifact_bytes.items():
             stored_artifact, stored_path = self.state.put_object(artifact_data)
@@ -247,7 +254,7 @@ class CommandRuntime:
         task_id = str(invocation.flags["--task-id"])
         run = self.state.create_run(task_id=task_id, paper_id=paper, bundle_id=bundle)
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "paper_id": paper,
             "bundle_id": bundle,
             "prepared_at": utc_now(),
@@ -270,20 +277,32 @@ class CommandRuntime:
         for record in artifact_records:
             if record["support_state"] == "supported" and record["media_kind"] == MediaKind.IMAGE:
                 visual_units.append({"unit_id": f"{record['artifact_ref_id']}:image", "artifact_ref_id": record["artifact_ref_id"], "artifact_id": record["artifact_id"], "media_kind": "image", "pdf_page": None})
-        all_units = [asdict(item) for _, extracted in documents for item in extracted.units]
-        all_batches = [asdict(item) for _, extracted in documents for item in extracted.batches]
+        all_sections = [asdict(item) for _, extracted in documents for item in extracted.sections]
+        for ordinal, section in enumerate(all_sections, start=1):
+            section["ordinal"] = ordinal
+        all_frames = [asdict(item) for _, extracted in documents for item in extracted.frames]
         all_pages = [asdict(page) | {"artifact_ref_id": record["artifact_ref_id"], "artifact_id": record["artifact_id"]} for record, extracted in documents for page in extracted.pages]
+        paper_text_tokens = sum(int(item["estimated_tokens"]) for item in all_sections)
+        emitted_text_tokens = sum(int(item["estimated_tokens"]) for item in all_frames)
+        transport_overhead_tokens = max(0, emitted_text_tokens - paper_text_tokens)
+        estimated_total_source_tokens = paper_text_tokens + transport_overhead_tokens
         inventory = {
-            "schema_version": 1,
+            "schema_version": 2,
             "paper_id": paper,
             "bundle_id": bundle,
             "run_id": run.run_id,
             "source_object_path": str(object_path),
             "object_paths": object_paths,
-            "units": all_units,
-            "batches": all_batches,
-            "visual_units": visual_units,
             "pages": all_pages,
+            "sections": all_sections,
+            "frames": all_frames,
+            "visual_units": visual_units,
+            "reading_policy": {
+                "semantic_unit": "section",
+                "transport_unit": "frame",
+                "transport_frame_token_limit": TRANSPORT_FRAME_TOKEN_LIMIT,
+                "current_epoch_required": True,
+            },
         }
         atomic_write_json(self.state.layout.run_dir(paper, run.run_id) / "inventory.json", inventory)
         self.state.append_event(
@@ -311,13 +330,28 @@ class CommandRuntime:
                 "proposed_scope_kind": "full",
                 "scope_locked": False,
                 "artifacts": artifact_records,
-                "reading_units": [{**item, "content": None} for item in all_units],
-                "read_batches": all_batches,
+                "sections": all_sections,
+                "transport_frames": [{**item, "content": None} for item in all_frames],
                 "visual_units": visual_units,
                 "page_counts": {record["artifact_ref_id"]: len(extracted.pages) for record, extracted in documents if record["media_kind"] == MediaKind.PDF},
-                "paper_input_estimate": sum(item["estimated_tokens"] for item in all_units) + len(visual_units) * 2000 + len(all_batches) * 512 + 4000,
+                "paper_input_estimate": estimated_total_source_tokens,
                 "artifact_exclusion_estimates": [],
-                "limits_applied": {"pdf_pages": 200, "unit_tokens": 4000, "batch_tokens": 12000},
+                "limits_applied": {
+                    "pdf_pages": 200,
+                    "semantic_unit": "section",
+                    "transport_frame_tokens": TRANSPORT_FRAME_TOKEN_LIMIT,
+                    "tool_output_tokens": 65_536,
+                    "auto_compact_tokens": 850_000,
+                },
+                "residency_plan": {
+                    "strategy": "full_source_section_stream",
+                    "paper_text_tokens": paper_text_tokens,
+                    "transport_overhead_tokens": transport_overhead_tokens,
+                    "estimated_total_source_tokens": estimated_total_source_tokens,
+                    "target_auto_compact_limit": 850_000,
+                    "context_reserve_tokens": 200_000,
+                    "estimated_to_fit": estimated_total_source_tokens <= 650_000,
+                },
                 "warnings": [warning for _, extracted in documents for page in extracted.pages for warning in page.warnings],
                 "scope_limitations": [],
             },
@@ -331,32 +365,42 @@ class CommandRuntime:
 
     def _read(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
+        if int(inventory.get("schema_version", 0)) != 2:
+            raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "read requires inventory schema 2")
+        if not run.scope_locked:
+            raise ReadPaperError(ErrorCode.STATE_CONFLICT, "reading scope must be locked before source emission")
+        if run.state not in {RunState.READING, RunState.REVIEWING, RunState.NEEDS_WORK, RunState.COMPLETE}:
+            raise ReadPaperError(ErrorCode.STATE_CONFLICT, f"source cannot be read while run is {run.state.value}")
         binding = self.state.get_binding(run.task_id)
-        if binding.current_response_attempt_id is None:
-            raise ReadPaperError(ErrorCode.ANSWER_NOT_STARTED, "answer --begin is required before reading")
-        units = inventory["units"]
-        if "--unit-id" in invocation.flags:
-            selected = [item for item in units if item["unit_id"] == invocation.flags["--unit-id"]]
-            mode = "unit"
-        else:
-            batches = [item for item in inventory["batches"] if item["batch_id"] == invocation.flags["--batch-id"]]
-            if not batches:
-                raise ReadPaperError(ErrorCode.NOT_FOUND, "reading batch not found")
-            ids = set(batches[0]["unit_ids"])
-            selected = [item for item in units if item["unit_id"] in ids]
-            mode = "inventory_batch"
-        if not selected:
-            raise ReadPaperError(ErrorCode.NOT_FOUND, "reading unit not found")
+        frame_id = str(invocation.flags["--frame-id"])
+        frame = next((item for item in inventory["frames"] if item["frame_id"] == frame_id), None)
+        if frame is None:
+            raise ReadPaperError(ErrorCode.NOT_FOUND, "transport frame not found")
+        section = next((item for item in inventory["sections"] if item["section_id"] == frame["section_id"]), None)
+        if section is None:
+            raise ReadPaperError(ErrorCode.ID_MISMATCH, "frame references a missing section")
+        if section["artifact_ref_id"] not in set(run.required_artifact_ref_ids):
+            raise ReadPaperError(ErrorCode.ACCESS_DENIED, "transport frame is outside the locked reading scope")
+        content = materialize_frame(pages=inventory["pages"], frame=frame, section=section)
+        frame_index = next(index for index, item in enumerate(inventory["frames"]) if item["frame_id"] == frame_id)
+        next_frame_id = (
+            inventory["frames"][frame_index + 1]["frame_id"]
+            if frame_index + 1 < len(inventory["frames"])
+            else None
+        )
         data = {
-            "inventory_batch_id": next(
-                item["batch_id"] for item in inventory["batches"] if selected[0]["unit_id"] in item["unit_ids"]
-            ),
-            "request_mode": mode,
-            "section_id": selected[0]["section_id"],
-            "batch_index": 1,
-            "batch_count": 1,
-            "units": selected,
-            "next_batch_id": None,
+            "request_mode": "section_transport_frame",
+            "section": {
+                key: section[key]
+                for key in (
+                    "section_id", "ordinal", "title", "normalized_title", "level",
+                    "parent_section_id", "start_page", "end_page", "estimated_tokens",
+                    "detection_method", "detection_confidence",
+                )
+            },
+            "frame": frame,
+            "content": content,
+            "next_frame_id": next_frame_id,
             "invocation_capability_id": capability["capability_id"],
             "client_request_id": invocation.flags["--client-request-id"],
             "tool_use_id": capability["tool_use_id"],
@@ -479,12 +523,13 @@ class CommandRuntime:
                         raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "invalid scope exclusion reason")
                     if item.get("user_confirmation_event_id") != authority_event_id:
                         raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "scope exclusion is not bound to the observed user turn")
-            selected_units = [item for item in inventory["units"] if item["artifact_ref_id"] in required_set]
+            selected_sections = [item for item in inventory["sections"] if item["artifact_ref_id"] in required_set]
+            selected_section_ids = {item["section_id"] for item in selected_sections}
+            selected_frames = [item for item in inventory["frames"] if item["section_id"] in selected_section_ids]
             selected_visuals = [item for item in inventory["visual_units"] if item["artifact_ref_id"] in required_set]
-            selected_batches = [item for item in inventory["batches"] if any(unit["unit_id"] in item["unit_ids"] for unit in selected_units)]
-            estimate = sum(int(item["estimated_tokens"]) for item in selected_units) + len(selected_visuals) * 2000 + len(selected_batches) * 512 + 4000
-            if estimate > 150000:
-                raise ReadPaperError(ErrorCode.OUTPUT_BUDGET_EXCEEDED, "locked scope exceeds the P0 150,000-token estimate")
+            estimate = sum(int(item["estimated_tokens"]) for item in selected_frames) + len(selected_visuals) * 2000 + 4000
+            if estimate > 650_000:
+                raise ReadPaperError(ErrorCode.OUTPUT_BUDGET_EXCEEDED, "locked scope exceeds the 650,000-token residency estimate")
             disclosure = ""
             if scope_kind is ScopeKind.USER_REDUCED:
                 lines = ["> ReadPaper 범위 제한: 다음 자료는 제외되어 이 답변은 요청 범위만 다룹니다."]
@@ -662,31 +707,82 @@ class CommandRuntime:
 
     def _check(self, invocation: Invocation, capability: None) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
+        if int(inventory.get("schema_version", 0)) != 2:
+            raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "check requires inventory schema 2")
         binding = self.state.get_binding(run.task_id)
-        required_refs = set(run.required_artifact_ref_ids) if run.scope_locked else {item["artifact_ref_id"] for item in inventory["units"]}
-        required = {item["unit_id"] for item in inventory["units"] if item["artifact_ref_id"] in required_refs}
-        observed: set[str] = set()
-        observed_visuals: set[str] = set()
+        required_refs = (
+            set(run.required_artifact_ref_ids)
+            if run.scope_locked
+            else {item["artifact_ref_id"] for item in inventory["sections"]}
+        )
+        required_section_ids = {
+            item["section_id"]
+            for item in inventory["sections"]
+            if item["artifact_ref_id"] in required_refs
+        }
+        frames_by_section: dict[str, set[str]] = {}
+        for frame in inventory["frames"]:
+            frames_by_section.setdefault(str(frame["section_id"]), set()).add(str(frame["frame_id"]))
+        required_frames = {
+            item["frame_id"]
+            for item in inventory["frames"]
+            if item["section_id"] in required_section_ids
+        }
+        host_state_path = self.state.layout.host_state(run.task_id)
+        host_state = read_json(host_state_path) if host_state_path.exists() else {}
+        main_context_stream_id = sequence_id("ctx", run.task_id, binding.session_id, "root")
+        main_context_epoch = int(
+            host_state.get("compact_streams", {})
+            .get(main_context_stream_id, {})
+            .get("context_epoch", 0)
+        )
+        historical_frames: set[str] = set()
+        resident_frames: set[str] = set()
+        historical_visuals: set[str] = set()
+        resident_visuals: set[str] = set()
         audit_result_events: dict[str, dict[str, Any]] = {}
         events_path = self.state.layout.run_events(run.paper_id, run.run_id)
         for line in events_path.read_text(encoding="utf-8").splitlines():
             event = json.loads(line)
-            if event["event_kind"] == "unit_emitted" and event["actor"] == "root_main" and event["result"] == "succeeded":
-                observed.add(event["subject_id"])
+            if event["event_kind"] == "source_frame_emitted" and event["actor"] == "root_main" and event["result"] == "succeeded":
+                frame_id = str(event["subject_id"])
+                historical_frames.add(frame_id)
+                if event.get("context_stream_id") == main_context_stream_id and int(event.get("context_epoch", -1)) == main_context_epoch:
+                    resident_frames.add(frame_id)
             if event["event_kind"] == "visual_open_observed" and event["actor"] == "root_main" and event["result"] == "succeeded":
-                observed_visuals.add(event["subject_id"])
+                visual_id = str(event["subject_id"])
+                historical_visuals.add(visual_id)
+                if event.get("context_stream_id") == main_context_stream_id and int(event.get("context_epoch", -1)) == main_context_epoch:
+                    resident_visuals.add(visual_id)
             if event["event_kind"] == "audit_result_recorded" and event["result"] == "succeeded":
                 record_id = event.get("payload", {}).get("record_id")
                 if isinstance(record_id, str):
                     audit_result_events[record_id] = event
-        missing = sorted(required - observed)
+        missing_historical_frames = sorted(required_frames - historical_frames)
+        missing_resident_frames = sorted(required_frames - resident_frames)
+        historical_section_ids = {
+            section_id
+            for section_id, frame_ids in frames_by_section.items()
+            if frame_ids and frame_ids <= historical_frames
+        }
+        resident_section_ids = {
+            section_id
+            for section_id, frame_ids in frames_by_section.items()
+            if frame_ids and frame_ids <= resident_frames
+        }
+        missing_resident_section_ids = sorted(required_section_ids - resident_section_ids)
         required_visuals = {item["unit_id"] for item in inventory["visual_units"] if item["artifact_ref_id"] in required_refs}
-        missing_visuals = sorted(required_visuals - observed_visuals)
+        missing_historical_visuals = sorted(required_visuals - historical_visuals)
+        missing_resident_visuals = sorted(required_visuals - resident_visuals)
         blockers = []
         if not run.scope_locked:
             blockers.append("scope_not_locked")
-        blockers.extend(missing)
-        blockers.extend(missing_visuals)
+        if run.state is RunState.COMPLETE:
+            blockers.extend(missing_historical_frames)
+            blockers.extend(missing_historical_visuals)
+        else:
+            blockers.extend(missing_resident_section_ids)
+            blockers.extend(missing_resident_visuals)
         record_kinds: dict[str, list[dict[str, Any]]] = {}
         records_path = self.state.layout.run_records(run.paper_id, run.run_id)
         if records_path.exists():
@@ -718,8 +814,6 @@ class CommandRuntime:
                 -2,
             )
         ]
-        host_state_path = self.state.layout.host_state(run.task_id)
-        host_state = read_json(host_state_path) if host_state_path.exists() else {}
         reviewer_bindings = host_state.get("reviewer_bindings", {})
         for result_record in latest_results:
             result_payload = result_record.get("payload", {})
@@ -795,16 +889,9 @@ class CommandRuntime:
         blockers.extend(f"audit:{role}" for role in pending_audits)
         blockers.extend(f"invalid_agent_execution:{item}" for item in sorted(invalid_agent_execution_ids))
         requested_answer_id = invocation.flags.get("--answer-id")
-        if binding.pending_answer_id is not None and requested_answer_id not in {
-            None,
-            binding.pending_answer_id,
-        }:
+        if binding.pending_answer_id is not None and requested_answer_id is not None and requested_answer_id != binding.pending_answer_id:
             raise ReadPaperError(ErrorCode.STATE_CONFLICT, "pending answer cannot be bypassed")
-        answer_id = binding.pending_answer_id
-        if answer_id is None and isinstance(requested_answer_id, str):
-            answer_id = requested_answer_id
-        if answer_id is None and binding.delivery_candidate_answer_id is not None:
-            answer_id = binding.delivery_candidate_answer_id
+        answer_id = requested_answer_id if isinstance(requested_answer_id, str) else None
         finalized_content_sha256 = None
         answer_status = None
         response_attempt_id = None
@@ -861,22 +948,18 @@ class CommandRuntime:
                 answer_delivery_state = "unknown"
             else:
                 answer_delivery_state = "not_finalized" if not finalized else "content_ready"
-        if run.state is RunState.REVIEWING and answer_id is None:
-            blockers.append("answer_not_started")
         if blockers:
             decision = "block"
-        elif binding.pending_answer_id is not None:
+        elif answer_id is not None and answer_status not in {
+            AnswerStatus.CONTENT_FINALIZED.value,
+            AnswerStatus.SENT_VERIFIED.value,
+            AnswerStatus.DELIVERY_UNKNOWN.value,
+        }:
             decision = "ready_to_finalize_content"
+        elif answer_id is None:
+            decision = "reading_ready"
         else:
             decision = "allow"
-        main_context_stream_id = sequence_id(
-            "ctx", run.task_id, binding.session_id, "root"
-        )
-        main_context_epoch = int(
-            host_state.get("compact_streams", {})
-            .get(main_context_stream_id, {})
-            .get("context_epoch", 0)
-        )
         data = {
             "run_state": run.state.value,
             "scope_kind": run.scope_kind.value,
@@ -888,10 +971,36 @@ class CommandRuntime:
                 if answer_delivery_state == "pending_observation"
                 else (["delivery_observer_unavailable"] if answer_delivery_state == "unknown" else [])
             ),
-            "historical_coverage": {"reading": len(observed), "required": len(required)},
-            "synthesis_coverage": {"reading": len(observed), "required": len(required)},
-            "missing_reading_unit_ids": missing,
-            "missing_visual_unit_ids": missing_visuals,
+            "historical_coverage": {
+                "frames": len(historical_frames & required_frames),
+                "required_frames": len(required_frames),
+                "sections": len(historical_section_ids & required_section_ids),
+                "required_sections": len(required_section_ids),
+                "visuals": len(historical_visuals & required_visuals),
+                "required_visuals": len(required_visuals),
+            },
+            "resident_coverage": {
+                "context_stream_id": main_context_stream_id,
+                "context_epoch": main_context_epoch,
+                "frames": len(resident_frames & required_frames),
+                "required_frames": len(required_frames),
+                "sections": len(resident_section_ids & required_section_ids),
+                "required_sections": len(required_section_ids),
+                "visuals": len(resident_visuals & required_visuals),
+                "required_visuals": len(required_visuals),
+            },
+            "synthesis_coverage": {
+                "frames": len(resident_frames & required_frames),
+                "required_frames": len(required_frames),
+                "sections": len(resident_section_ids & required_section_ids),
+                "required_sections": len(required_section_ids),
+            },
+            "missing_historical_frame_ids": missing_historical_frames,
+            "missing_resident_frame_ids": missing_resident_frames,
+            "missing_resident_section_ids": missing_resident_section_ids,
+            "missing_historical_visual_unit_ids": missing_historical_visuals,
+            "missing_resident_visual_unit_ids": missing_resident_visuals,
+            "full_source_currently_resident": not missing_resident_frames,
             "pending_audit_ids": pending_audits,
             "pending_finding_ids": [],
             "invalid_agent_execution_ids": sorted(invalid_agent_execution_ids),
@@ -1013,7 +1122,7 @@ class CommandRuntime:
             to_state=run.resume_phase, actor=Actor.ROOT_MAIN, reason_code="explicit_user_resume",
         )
         binding = self.state.get_binding(run.task_id)
-        return self._success("resume", run.paper_id, run.bundle_id, run.run_id, {"resume_phase": run.resume_phase.value, "pending_answer_id": binding.pending_answer_id, "answer_resume_required": binding.pending_answer_status == "interrupted", "pending_reading_unit_ids": [], "pending_visual_unit_ids": [], "pending_audit_ids": [], "pending_finding_ids": [], "scope_limitations": [], "session_epoch": binding.session_epoch, "main_context_stream_id": capability["context_stream_id"], "main_context_epoch": capability["context_epoch"], "event_id": event.event_id})
+        return self._success("resume", run.paper_id, run.bundle_id, run.run_id, {"resume_phase": run.resume_phase.value, "pending_answer_id": binding.pending_answer_id, "answer_resume_required": binding.pending_answer_status == "interrupted", "pending_reading_frame_ids": [], "pending_visual_unit_ids": [], "pending_audit_ids": [], "pending_finding_ids": [], "scope_limitations": [], "session_epoch": binding.session_epoch, "main_context_stream_id": capability["context_stream_id"], "main_context_epoch": capability["context_epoch"], "event_id": event.event_id})
 
     def _delete(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         paper = invocation.positional[0]

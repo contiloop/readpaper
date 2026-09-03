@@ -226,8 +226,8 @@ class StopCoordinator:
         task_id: str,
         turn_id: str,
     ) -> tuple[str, str] | None:
-        # Reading/render remediation is valid only after the user-bound answer and
-        # immutable scope exist.  Those two steps require fresh observed user
+        # Stop continuations repair an answer attempt, not answer-independent
+        # ingestion. Scope locking and answer creation require observed user
         # authority and cannot be synthesized by a Stop continuation.
         if check.get("answer_id") is None or "scope_not_locked" in (check.get("blocking_ids") or []):
             return None
@@ -248,11 +248,11 @@ class StopCoordinator:
                 client,
             ]
             return _quote(tokens), client
-        missing_text = check.get("missing_reading_unit_ids") or []
+        missing_text = check.get("missing_resident_frame_ids") or []
         if missing_text:
-            tokens = prefix + ["read", run_id, "--unit-id", str(missing_text[0]), "--client-request-id", client]
+            tokens = prefix + ["read", run_id, "--frame-id", str(missing_text[0]), "--client-request-id", client]
             return _quote(tokens), client
-        missing_visual = check.get("missing_visual_unit_ids") or []
+        missing_visual = check.get("missing_resident_visual_unit_ids") or []
         if missing_visual:
             tokens = prefix + ["render", run_id, "--unit-id", str(missing_visual[0]), "--client-request-id", client]
             return _quote(tokens), client

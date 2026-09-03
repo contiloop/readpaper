@@ -43,7 +43,7 @@ def test_audit_reservation_has_nonce_and_null_pre_spawn_binding() -> None:
     assert reservation["reviewer_assignment_id"].startswith("rva_")
     assert len(reservation["assignment_nonce"]) == 64
     assert reservation["reviewer_agent_id"] is None
-    assert reservation["read_unit_ids"] == reservation["findings"] == []
+    assert reservation["read_frame_ids"] == reservation["findings"] == []
 
 
 def test_content_finding_ids_are_gapless_and_body_bound() -> None:

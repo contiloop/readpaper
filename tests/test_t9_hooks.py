@@ -61,14 +61,14 @@ def prepared_run(tmp_path: Path) -> tuple[CommandRuntime, dict, str, str]:
     scope = payload_dir / "scope.json"
     scope.write_text(json.dumps({"scope_kind": "full", "required_artifact_ref_ids": [ref], "excluded_artifacts": [], "user_turn_id": "turn-0"}))
     execute_authorized(runtime, ["record", run_id, "--kind", "scope_confirmation", "--payload", str(scope), "--client-request-id", "cr_" + "3" * 32], "bootstrap-scope")
-    return runtime, prepared, prepared["data"]["reading_units"][0]["unit_id"], prepared["data"]["visual_units"][0]["unit_id"]
+    return runtime, prepared, prepared["data"]["transport_frames"][0]["frame_id"], prepared["data"]["visual_units"][0]["unit_id"]
 
 
 def test_pretool_issues_capability_and_posttool_is_only_read_coverage_authority(tmp_path: Path) -> None:
-    runtime, prepared, unit_id, _ = prepared_run(tmp_path)
+    runtime, prepared, frame_id, _ = prepared_run(tmp_path)
     observer = DesktopObserver(tmp_path)
     client = "cr_" + "4" * 32
-    words = [str((tmp_path / ".venv/bin/python").resolve()), str((tmp_path / ".agents/skills/readpaper/scripts/paper.py").resolve()), "read", prepared["run_id"], "--unit-id", unit_id, "--client-request-id", client]
+    words = [str((tmp_path / ".venv/bin/python").resolve()), str((tmp_path / ".agents/skills/readpaper/scripts/paper.py").resolve()), "read", prepared["run_id"], "--frame-id", frame_id, "--client-request-id", client]
     command = quote(words)
     base = {"session_id": "session", "turn_id": "turn-1", "cwd": str(tmp_path), "tool_name": "Bash", "tool_use_id": "tool-read", "tool_input": {"command": command}}
     allowed = json.loads(observer.pre_tool({"hook_event_name": "PreToolUse", **base}))
@@ -77,10 +77,91 @@ def test_pretool_issues_capability_and_posttool_is_only_read_coverage_authority(
     assert invocation is not None
     response = runtime.execute(invocation).decode()
     before = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))
-    assert unit_id in before["data"]["missing_reading_unit_ids"]
+    assert frame_id in before["data"]["missing_resident_frame_ids"]
     observer.post_tool({"hook_event_name": "PostToolUse", **base, "tool_response": {"output": response}})
     after = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))
-    assert unit_id not in after["data"]["missing_reading_unit_ids"]
+    assert frame_id not in after["data"]["missing_resident_frame_ids"]
+
+
+def test_observer_rejects_frame_with_wrong_content_hash(tmp_path: Path) -> None:
+    runtime, prepared, frame_id, _ = prepared_run(tmp_path)
+    observer = DesktopObserver(tmp_path)
+    client = "cr_" + "5" * 32
+    words = [
+        str((tmp_path / ".venv/bin/python").resolve()),
+        str((tmp_path / ".agents/skills/readpaper/scripts/paper.py").resolve()),
+        "read",
+        prepared["run_id"],
+        "--frame-id",
+        frame_id,
+        "--client-request-id",
+        client,
+    ]
+    command = quote(words)
+    base = {
+        "session_id": "session",
+        "turn_id": "turn-1",
+        "cwd": str(tmp_path),
+        "tool_name": "Bash",
+        "tool_use_id": "tool-truncated-read",
+        "tool_input": {"command": command},
+    }
+    observer.pre_tool({"hook_event_name": "PreToolUse", **base})
+    invocation = parse_argv(words[2:])
+    assert invocation is not None
+    response = json.loads(runtime.execute(invocation))
+    response["data"]["content"] = response["data"]["content"][:-1]
+    observer.post_tool({
+        "hook_event_name": "PostToolUse",
+        **base,
+        "tool_response": {"output": json.dumps(response)},
+    })
+    checked = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))
+    assert frame_id in checked["data"]["missing_historical_frame_ids"]
+
+
+def test_previous_epoch_frames_remain_historical_but_not_resident(tmp_path: Path) -> None:
+    runtime, prepared, frame_id, _ = prepared_run(tmp_path)
+    observer = DesktopObserver(tmp_path)
+    client = "cr_" + "6" * 32
+    words = [
+        str((tmp_path / ".venv/bin/python").resolve()),
+        str((tmp_path / ".agents/skills/readpaper/scripts/paper.py").resolve()),
+        "read",
+        prepared["run_id"],
+        "--frame-id",
+        frame_id,
+        "--client-request-id",
+        client,
+    ]
+    command = quote(words)
+    base = {
+        "session_id": "session",
+        "turn_id": "turn-1",
+        "cwd": str(tmp_path),
+        "tool_name": "Bash",
+        "tool_use_id": "tool-epoch-read",
+        "tool_input": {"command": command},
+    }
+    observer.pre_tool({"hook_event_name": "PreToolUse", **base})
+    invocation = parse_argv(words[2:])
+    assert invocation is not None
+    response = runtime.execute(invocation).decode()
+    observer.post_tool({"hook_event_name": "PostToolUse", **base, "tool_response": {"output": response}})
+    compact_base = {
+        "session_id": "session",
+        "cwd": str(tmp_path),
+        "trigger": "auto",
+        "task_id": "task",
+    }
+    observer.compact({"hook_event_name": "PreCompact", **compact_base})
+    observer.compact({"hook_event_name": "PostCompact", **compact_base})
+    checked = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))
+    assert checked["data"]["historical_coverage"]["frames"] == 1
+    assert checked["data"]["resident_coverage"]["frames"] == 0
+    assert checked["data"]["missing_historical_frame_ids"] == []
+    assert checked["data"]["missing_resident_frame_ids"] == [frame_id]
+    assert checked["data"]["full_source_currently_resident"] is False
 
 
 def test_pretool_allows_canonical_read_only_check_without_capability(tmp_path: Path) -> None:
@@ -159,7 +240,7 @@ def test_reviewer_start_and_protected_challenge_bind_reserved_execution(tmp_path
         "reviewer_agent_id": reviewer_id,
         "reviewer_synthesis_epoch": 0,
         "status": "returned",
-        "read_unit_ids": [],
+        "read_frame_ids": [],
         "opened_visual_unit_ids": [],
         "unverified_scope": [],
         "findings": [],
@@ -237,7 +318,7 @@ def test_reviewer_start_and_protected_challenge_bind_reserved_execution(tmp_path
         "reviewer_agent_id": reviewer_id,
         "reviewer_synthesis_epoch": 0,
         "status": "returned",
-        "read_unit_ids": [],
+        "read_frame_ids": [],
         "opened_visual_unit_ids": [],
         "unverified_scope": [],
         "findings": [],
@@ -317,7 +398,7 @@ def test_copied_reviewer_challenge_from_another_agent_fails_closed(tmp_path: Pat
         "reviewer_agent_id": "copying-reviewer",
         "reviewer_synthesis_epoch": 0,
         "status": "returned",
-        "read_unit_ids": [],
+        "read_frame_ids": [],
         "opened_visual_unit_ids": [],
         "unverified_scope": [],
         "findings": [],

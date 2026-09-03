@@ -41,7 +41,7 @@ ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.COMPLETE: set(),
 }
 AGENT_CONTEXT_EVENTS = {
-    EventKind.UNIT_EMITTED,
+    EventKind.SOURCE_FRAME_EMITTED,
     EventKind.RENDER_CREATED,
     EventKind.VISUAL_OPEN_OBSERVED,
     EventKind.NOTE_VERSIONED,

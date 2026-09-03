@@ -15,7 +15,7 @@ CLIENT_RE = re.compile(r"^cr_[0-9a-f]{32}$")
 COMMANDS = ("prepare", "read", "render", "record", "check", "answer", "resume", "delete")
 SCHEMA = {
     "prepare": {"positionals": 1, "required": ("--task-id", "--user-turn-id", "--client-request-id"), "optional": ()},
-    "read": {"positionals": 1, "required": ("--client-request-id",), "optional": ("--unit-id", "--batch-id")},
+    "read": {"positionals": 1, "required": ("--frame-id", "--client-request-id"), "optional": ()},
     "render": {"positionals": 1, "required": ("--unit-id", "--client-request-id"), "optional": ("--locator-id", "--render-dpi")},
     "record": {"positionals": 1, "required": ("--kind", "--payload", "--client-request-id"), "optional": ()},
     "check": {"positionals": 1, "required": (), "optional": ("--answer-id",)},
@@ -70,8 +70,10 @@ def parse_argv(argv: Iterable[str]) -> Invocation | None:
     client = flags.get("--client-request-id")
     if client is not None and (not isinstance(client, str) or CLIENT_RE.fullmatch(client) is None):
         return None
-    if command == "read" and sum(name in flags for name in ("--unit-id", "--batch-id")) != 1:
-        return None
+    if command == "read":
+        frame_id = flags.get("--frame-id")
+        if not isinstance(frame_id, str) or not frame_id.startswith("rf_"):
+            return None
     if command == "answer":
         modes = [name for name in ("--begin", "--resume", "--abandon", "--finalize") if name in flags]
         if len(modes) != 1:
