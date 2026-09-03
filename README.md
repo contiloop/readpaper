@@ -11,7 +11,7 @@ ReadPaper is built around one principle: the current Codex Main agent must actua
 The workflow combines:
 
 - a Codex skill that defines the reading, audit, report, and Q&A procedure;
-- Python tools that fetch/prepare public PDFs, extract page-bounded text, render pages, manage locators, and verify state;
+- Python tools that fetch/prepare public PDFs, preserve canonical page text, detect logical sections, create bounded transport frames, render pages, manage locators, and verify state;
 - Codex Desktop hooks that bind user turns, protected tool calls, reviewer agents, compaction, and Stop delivery observations;
 - reviewer roles for math/visual checks, claim/experiment checks, and explanation-flow checks;
 - tests and host probes for the P0 Desktop acceptance gate.
@@ -91,13 +91,14 @@ Inside a Codex Desktop task opened in this project, ask to read a paper from a p
 For a new whole-paper request, the expected flow is:
 
 1. prepare the source and proposed full scope;
-2. begin an answer attempt and lock the reading scope;
-3. read every required text batch in order;
+2. lock the reading scope;
+3. read every required logical section in order, consuming consecutive transport frames when a section exceeds one tool response;
 4. render/open required visual pages;
 5. write an understanding note;
 6. run independent reviewer audits;
-7. ground the answer/report in confirmed locators;
-8. finalize the answer before sending it.
+7. verify that the whole source is resident in the current Main context epoch;
+8. begin an answer attempt and ground the answer/report in confirmed locators;
+9. finalize the answer before sending it.
 
 For this workspace’s Korean report style, `AGENTS.md` currently fixes these defaults:
 

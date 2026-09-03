@@ -4,7 +4,7 @@ Reserve each reviewer assignment before spawning it. Pass only the reservation n
 
 ## Content audits
 
-- `math_visual`: read all required text in one reviewer epoch; open every equation/figure/table/algorithm candidate page and every extraction-warning page. Check definitions, conditions, axes, legends, rows, columns, units, and appendix links.
+- `math_visual`: read all required section frames in one reviewer epoch; open every equation/figure/table/algorithm candidate page and every extraction-warning page. Check definitions, conditions, axes, legends, rows, columns, units, and appendix links.
 - `claim_experiment`: read all required text in one reviewer epoch; open method, experiment, result, limitation, and appendix-connection pages. Check whether claims match design, results, scope, and limitations.
 
 Each role first returns `source_first` without seeing Main's note. The same reviewer then receives the fixed note version for `note_comparison`.

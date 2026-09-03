@@ -19,16 +19,16 @@ Choose the smallest applicable route:
 - **Semantic follow-up:** begin an answer, reopen only the confirmed locators needed for the new claims, then draft, ground, and finalize the answer. Do not repeat whole-paper coverage or content audits for a complete run.
 - **Presentation-only edit:** when only Markdown math delimiters, figure embedding, links, headings, layout, or wording that introduces no new paper claim changes, edit and validate the artifact directly. Do not open an answer lifecycle or rerun paper audits. If the change might alter meaning, use the semantic route.
 
-- For a new source: `prepare`, then immediately `answer --begin` in the same response turn, show the artifact scope, lock scope with `record --kind scope_confirmation`, and only then read.
+- For a new source: `prepare`, show the artifact scope, lock scope with `record --kind scope_confirmation`, and then ingest the paper before beginning an answer.
 - For a question about the current completed paper: the first ReadPaper action is `answer --begin`.
 - If an answer's content is still drafting or interrupted, do not start another question. Ask for explicit resume or abandon and use the matching lifecycle command. A delivery observation that is pending or unknown does not block a new question.
 - After a Desktop session boundary, do not claim prior live context. Resume the run explicitly; if an answer is pending, resume it in the same root execution.
 
 ## Read and verify
 
-Read inventory batches serially in document order. Request enough tool output for the 12,000-token data envelope and verify every unit's hashes, bounds, and start/middle/end markers. Open every required PDF page and supported standalone image yourself; render creation is not visual confirmation.
+Read logical sections in source order. If a section has multiple transport frames, read all of its frames consecutively before moving to the next section; do not summarize or finalize the section between frames. Frames are transport details, not semantic units. Verify every frame's ID, full content hash, source ranges, and start/middle/end markers. Open every required PDF page and supported standalone image yourself; render creation is not visual confirmation.
 
-Before writing the understanding note, complete one uninterrupted synthesis pass over every required text and visual unit in one Main session/context epoch. If Main compacts or the session changes, restart that synthesis pass. Subagent compaction does not invalidate Main coverage.
+Count a section as historically covered only after all of its frames have been observed at least once. Count it as currently resident only when root Main observed all frames in the current context stream and epoch. Before writing the understanding note, complete one uninterrupted synthesis pass over every required section frame and visual unit in one Main session/context epoch. If Main compacts or the session changes, restart that synthesis pass. Preserve earlier epochs as historical coverage, but do not count them as current residency. Do not let subagent compaction invalidate Main coverage.
 
 Record printed labels only after opening the page. Keep printed labels distinct from PDF page numbers. Confirm locators before using them as evidence.
 
@@ -41,6 +41,8 @@ Use the independent reviewer contracts in [references/audits.md](references/audi
 For every answer, create a new immutable draft for the current response attempt, distinguish paper claims from Main inference and unsupported conclusions, and attach confirmed locators. Apply the fixed scope disclosure as the exact last block when scope is reduced.
 
 All paper answers require current-attempt source reopening and `answer_grounding`, even when the run is already complete. Run flow review when explicitly requested, tutorial-level, interpretively contentious, or at least 1,200 safe-estimated tokens.
+
+Begin an answer before writing answer-specific drafts, running an answer flow audit, recording answer grounding, or finalizing content. An answer attempt is not required for preparation, scope locking, source ingestion, visual inspection, understanding notes, content audits, or a run-only `check`.
 
 Run `check`, resolve every blocker, and when it returns `ready_to_finalize_content`, call `answer --finalize` before sending the exact finalized content. Content completion and run completion are committed there. Stop observation may later upgrade delivery to `sent_verified`; if Desktop cannot observe it, record `delivery_unknown` without reopening content or blocking the next question.
 
