@@ -4,7 +4,7 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 
 ## New paper
 
-1. Call `prepare <source> --task-id <task> --user-turn-id <turn> --client-request-id <cr>`.
+1. Call `prepare <source> --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Add `--ingest-only` only when the user explicitly wants the paper read now without a report or answer in this turn; ordinary preparation is answer-required.
 2. Inspect the returned artifact list, unsupported items, warnings, section/frame inventory, visual inventory, and residency estimate. Preparation is not reading.
 3. Show the proposed scope. Full scope includes the main paper, references, appendices, and all supported public supplementary items. A reduced scope requires the user's exact exclusion turn and structured excluded refs.
 4. Lock it with `record --kind scope_confirmation`.
@@ -13,15 +13,16 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 7. Repeat all required section frames and visual units in one uninterrupted Main synthesis epoch, then record the understanding note.
 8. Run both content audit roles through source-first and note-comparison stages. Resolve every finding from reopened confirmed source locations.
 9. Call `check` without an answer ID. Resolve blockers until it returns `reading_ready`.
-10. Call `answer <run> --begin ...` only when composing the user-facing response.
-11. Draft the answer for the current response attempt, run flow audit when required, remediate, finalize, reopen relevant locators, and record grounding.
-12. Call `check --answer-id <answer>`. Resolve blockers until it returns `ready_to_finalize_content`.
-13. Call `answer <run> --finalize --answer-id <answer> ...`. This commits content completion and, for the initial answer, run completion without claiming UI delivery.
-14. Return the exact finalized content. Stop observation upgrades delivery to `sent_verified`; an unavailable observation remains a nonblocking delivery warning.
+10. Call `run <run> --finalize-reading --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Confirm `run_state=read_complete` and `active_run_released=true`; the current run remains available for later answers.
+11. If this is an ingest-only run, acknowledge reading completion without making paper-content claims and stop here. Otherwise call `answer <run> --begin ...` before composing the user-facing response.
+12. Draft the answer for the current response attempt, run flow audit when required, remediate, finalize the draft, reopen relevant locators, and record grounding.
+13. Call `check --answer-id <answer>`. Resolve blockers until it returns `ready_to_finalize_content`.
+14. Call `answer <run> --finalize --answer-id <answer> ...`. This commits answer-content completion without changing the run's `read_complete` state or claiming UI delivery.
+15. Return the exact finalized content. Stop observation upgrades delivery to `sent_verified`; an unavailable observation remains a nonblocking delivery warning.
 
 ## Follow-up question
 
-Call `answer --begin` before answer-specific source reopening. Open only the confirmed locations needed for this question in the current attempt and epoch. Create a new draft/finalization/grounding chain, run `check --answer-id`, then `answer --finalize`. Whole-paper coverage and content audits remain inherited from the immutable complete run and are not repeated unless current full-source residency is explicitly required again.
+Call `answer --begin` on the current `read_complete` run before answer-specific source reopening. Open only the confirmed locations needed for this question in the current attempt and epoch. Create a new draft/finalization/grounding chain, run `check --answer-id`, then `answer --finalize`. Multiple answers may attach to the same completed reading run. Whole-paper coverage and content audits remain inherited and are not repeated unless current full-source emission coverage is explicitly required again.
 
 ## Presentation-only artifact edit
 

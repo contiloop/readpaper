@@ -16,10 +16,11 @@ Read [references/workflow.md](references/workflow.md) before the first ReadPaper
 Choose the smallest applicable route:
 
 - **Whole-paper run:** use the full reading and audit workflow for a new paper or a new immutable run.
-- **Semantic follow-up:** begin an answer, reopen only the confirmed locators needed for the new claims, then draft, ground, and finalize the answer. Do not repeat whole-paper coverage or content audits for a complete run.
+- **Semantic follow-up:** begin an answer on a `read_complete` run, reopen only the confirmed locators needed for the new claims, then draft, ground, and finalize the answer. Do not repeat whole-paper coverage or content audits.
 - **Presentation-only edit:** when only Markdown math delimiters, figure embedding, links, headings, layout, or wording that introduces no new paper claim changes, edit and validate the artifact directly. Do not open an answer lifecycle or rerun paper audits. If the change might alter meaning, use the semantic route.
 
-- For a new source: `prepare`, show the artifact scope, lock scope with `record --kind scope_confirmation`, and then ingest the paper before beginning an answer.
+- For a new source: `prepare`, show the artifact scope, lock scope with `record --kind scope_confirmation`, ingest and audit the paper, pass the run-only `check`, and call `run --finalize-reading` before beginning an answer.
+- Use ordinary `prepare` when the current request needs a user-facing report or answer. Use `prepare --ingest-only` only when the user explicitly asks to read now and answer later; it permits clean completion without opening an answer lifecycle.
 - For a question about the current completed paper: the first ReadPaper action is `answer --begin`.
 - If an answer's content is still drafting or interrupted, do not start another question. Ask for explicit resume or abandon and use the matching lifecycle command. A delivery observation that is pending or unknown does not block a new question.
 - After a Desktop session boundary, do not claim prior live context. Resume the run explicitly; if an answer is pending, resume it in the same root execution.
@@ -28,7 +29,7 @@ Choose the smallest applicable route:
 
 Read logical sections in source order. If a section has multiple transport frames, read all of its frames consecutively before moving to the next section; do not summarize or finalize the section between frames. Frames are transport details, not semantic units. Verify every frame's ID, full content hash, source ranges, and start/middle/end markers. Open every required PDF page and supported standalone image yourself; render creation is not visual confirmation.
 
-Count a section as historically covered only after all of its frames have been observed at least once. Count it as currently resident only when root Main observed all frames in the current context stream and epoch. Before writing the understanding note, complete one uninterrupted synthesis pass over every required section frame and visual unit in one Main session/context epoch. If Main compacts or the session changes, restart that synthesis pass. Preserve earlier epochs as historical coverage, but do not count them as current residency. Do not let subagent compaction invalidate Main coverage.
+Count a section as historically covered only after all of its frames have been observed at least once. Count current-epoch emission coverage only when root Main observed all frames in the current context stream and epoch. This proves that all source frames were emitted in that epoch; it does not independently prove that the host retained every earlier tool output. Before writing the understanding note, complete one uninterrupted synthesis pass over every required section frame and visual unit in one Main session/context epoch. If Main compacts or the session changes, restart that synthesis pass. Preserve earlier epochs as historical coverage, but do not count them as current-epoch coverage. Do not let subagent compaction invalidate Main coverage.
 
 Record printed labels only after opening the page. Keep printed labels distinct from PDF page numbers. Confirm locators before using them as evidence.
 
@@ -44,6 +45,6 @@ All paper answers require current-attempt source reopening and `answer_grounding
 
 Begin an answer before writing answer-specific drafts, running an answer flow audit, recording answer grounding, or finalizing content. An answer attempt is not required for preparation, scope locking, source ingestion, visual inspection, understanding notes, content audits, or a run-only `check`.
 
-Run `check`, resolve every blocker, and when it returns `ready_to_finalize_content`, call `answer --finalize` before sending the exact finalized content. Content completion and run completion are committed there. Stop observation may later upgrade delivery to `sent_verified`; if Desktop cannot observe it, record `delivery_unknown` without reopening content or blocking the next question.
+First run `check` without an answer ID, resolve every blocker until it returns `reading_ready`, and call `run --finalize-reading`. This commits the independent `read_complete` state, releases the active-run slot, and retains the run as current. For an answer-required run, begin an answer before sending any user-facing paper report. Run `check --answer-id`, resolve every blocker, and when it returns `ready_to_finalize_content`, call `answer --finalize` before sending the exact finalized content. Answer finalization never changes reading completion. Stop observation may later upgrade delivery to `sent_verified`; if Desktop cannot observe it, record `delivery_unknown` without reopening content or blocking the next question.
 
 Never claim `full_paper_in_live_context`, `understanding_verified`, or semantic certainty from mechanical checks.

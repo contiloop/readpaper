@@ -84,6 +84,18 @@ Optional P0 automated evidence can be generated with:
 
 That command writes ignored evidence under `evidence/`.
 
+## Runtime profile and local-state upgrade
+
+The checked-in project profile pins `gpt-5.6-sol` with a 272,000-token context window, a 230,000-token automatic-compaction threshold, a 150,000-token source-emission budget, and a 65,536-token tool-output limit. `check` reports whether every required frame was emitted in the current Main context epoch; this is an observable emission guarantee, not a claim that the host independently proved every earlier tool result remains resident.
+
+Section/frame inventories use local schema 2. This release deliberately does not read schema-1 run inventories. Before upgrading a checkout that has existing `.readpaper` state, archive it from the repository root and start a new run:
+
+```sh
+mv .readpaper ".readpaper-schema-v1-backup-$(date +%Y%m%d-%H%M%S)"
+```
+
+The archive is local and ignored by Git. Restore it only with a release that supports schema 1.
+
 ## Use
 
 Inside a Codex Desktop task opened in this project, ask to read a paper from a public PDF URL or local PDF path. The project-local `readpaper` skill is the workflow authority.
@@ -96,9 +108,12 @@ For a new whole-paper request, the expected flow is:
 4. render/open required visual pages;
 5. write an understanding note;
 6. run independent reviewer audits;
-7. verify that the whole source is resident in the current Main context epoch;
-8. begin an answer attempt and ground the answer/report in confirmed locators;
-9. finalize the answer before sending it.
+7. verify that every required source frame was emitted in the current Main context epoch;
+8. finalize reading into the independent `read_complete` state, releasing the active-run slot while retaining the current run;
+9. for an answer-required run, begin an answer attempt and ground the answer/report in confirmed locators;
+10. finalize the answer content before sending it.
+
+Use `prepare --ingest-only` only for “read it now; questions later” requests. It can finish at `read_complete` without an answer. Ordinary `prepare` creates an answer-required run, and the Stop hook blocks a paper report until an answer has been begun, grounded, checked, and finalized. Any number of later answers can attach to the same `read_complete` run; finalizing an answer does not complete or mutate the reading lifecycle.
 
 For this workspace’s Korean report style, `AGENTS.md` currently fixes these defaults:
 
