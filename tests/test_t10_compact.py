@@ -18,18 +18,18 @@ def payload(root: Path, event: str, *, agent_id: str | None = None, trigger: str
     return value
 
 
-def test_exact_p0_compaction_configuration() -> None:
+def test_long_context_configuration() -> None:
     root = Path(__file__).resolve().parents[1]
     with (root / ".codex/config.toml").open("rb") as handle:
         config = tomllib.load(handle)
     assert config == {
-        "model_auto_compact_token_limit": 230000,
+        "model_auto_compact_token_limit": 850000,
         "model_auto_compact_token_limit_scope": "total",
-        "tool_output_token_limit": 16000,
+        "tool_output_token_limit": 65536,
     }
-    assert 258400 - config["model_auto_compact_token_limit"] == 28400
-    assert 8000 + 4000 < 28400
-    assert config["tool_output_token_limit"] == 16000
+    model_context = 1_050_000
+    assert model_context - config["model_auto_compact_token_limit"] >= 200_000
+    assert 48_000 < config["tool_output_token_limit"]
 
 
 def test_compact_epochs_are_stream_local_and_pair_checked(tmp_path: Path) -> None:

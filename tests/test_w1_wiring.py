@@ -23,7 +23,9 @@ def test_wiring_manifest_and_hook_cardinality() -> None:
     for role, expected in manifest["roles"].items():
         assert hashlib.sha256((ROOT / ".codex/agents" / f"{role}.toml").read_bytes()).hexdigest() == expected
     with (ROOT / ".codex/config.toml").open("rb") as handle:
-        assert tomllib.load(handle)["model_auto_compact_token_limit"] == 230000
+        config = tomllib.load(handle)
+    assert config["model_auto_compact_token_limit"] == 850000
+    assert config["tool_output_token_limit"] == 65536
 
 
 def test_local_generated_wiring_matches_when_present() -> None:
