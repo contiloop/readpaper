@@ -24,19 +24,16 @@ The workflow combines:
 ├── .codex/agents/                     # reviewer role definitions
 ├── .codex/config.toml                 # project-local Codex settings
 ├── .codex/hooks/                      # hook entrypoints
-├── .dryforge/spec.md                  # product/specification contract
-├── .dryforge/plan.md                  # implementation/acceptance plan
 ├── scripts/install_readpaper.py       # generates local hook wiring
 ├── tests/                             # automated unit and host-probe tests
-├── PROJECT_GOAL.md                    # product goal
-└── IMPLEMENTATION_PLAN.md             # historical design notes
+└── PROJECT_GOAL.md                    # product goal
 ```
 
 Ignored local state:
 
 - `.codex/hooks.json`
-- `.dryforge/handoff.md`
-- `.dryforge/wiring-manifest.json`
+- `.dryforge/`
+- `IMPLEMENTATION_PLAN.md`
 - `.readpaper/`
 - `papers/`
 - `reports/`

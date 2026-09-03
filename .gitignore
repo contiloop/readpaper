@@ -17,8 +17,8 @@ htmlcov/
 /reports/
 /evidence/
 /.codex/hooks.json
-/.dryforge/handoff.md
-/.dryforge/wiring-manifest.json
+/.dryforge/
+/IMPLEMENTATION_PLAN.md
 
 # BEGIN READPAPER MANAGED
 /papers/
