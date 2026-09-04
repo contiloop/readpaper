@@ -144,6 +144,8 @@ Supported text supplementary files (`.txt`, `.md`, `.markdown`, `.rst`) use `tex
 
 Stop visual repairs are explicitly `render → view_image(data.path) → check`. Rendering alone leaves the repair awaiting visual observation. The one-shot repair budget is reserved at request time to prevent duplicates; actual completion requires a matching image-open event. Each new run gets a fresh run-level repair budget.
 
+Automatic task messages do not always emit `UserPromptSubmit`. Ordinary full-scope progression can use the exact observed root Main command authorization instead, including scope locking, reading finalization, and answer begin/finalize. The evidence identifies the actual command source rather than inventing a user-input event. Exclusions and deletion still require their observed user approvals. For paper-only sessions, reuse the installed checkout to keep the effective hook paths consistent; installer checks alone do not establish which hooks the host loaded.
+
 For this workspace’s Korean report style, `AGENTS.md` currently fixes these defaults:
 
 - produce a Korean Markdown report after whole-paper reading unless the user asks otherwise;

@@ -39,6 +39,8 @@ from .models import (
     Actor,
     EventKind,
     EventResult,
+    HostEvent,
+    HostEventKind,
     RecordKind,
     RunCompletionMode,
     RunState,
@@ -646,7 +648,11 @@ class CommandRuntime:
                 scope_kind = ScopeKind(payload["scope_kind"])
                 required = list(payload["required_artifact_ref_ids"])
                 excluded = list(payload["excluded_artifacts"])
-                authority_turn = self.state.find_user_turn(task_id=run.task_id, turn_or_event_id=str(payload["user_turn_id"]))
+                authority_turn = (
+                    self.state.find_user_turn(task_id=run.task_id, turn_or_event_id=str(payload["user_turn_id"]))
+                    if scope_kind is ScopeKind.USER_REDUCED
+                    else self._workflow_authority(run, capability, payload.get("user_turn_id"), allow_prior_user_turn=True)
+                )
                 authority_event_id = authority_turn.host_event_id
             except (KeyError, TypeError, ValueError) as error:
                 raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "invalid scope confirmation payload") from error
@@ -687,7 +693,8 @@ class CommandRuntime:
                     lines.append(f"> - ref={item['artifact_ref_id']}; media={artifact_item['media_kind']}; reason={item['reason_code']}; failure={artifact_item.get('failure_code') or 'none'}")
                 disclosure = "\n".join(lines)
             disclosure_sha = digest_text(disclosure)
-            payload = payload | {"scope_disclosure_markdown": disclosure, "scope_disclosure_sha256": disclosure_sha, "paper_input_estimate": estimate}
+            payload = payload | {"scope_disclosure_markdown": disclosure, "scope_disclosure_sha256": disclosure_sha,
+                                 "paper_input_estimate": estimate, "authority_event_kind": authority_turn.event_kind.value}
             record = self.state.put_versioned_record(
                 paper_id=run.paper_id, run_id=run.run_id, record_kind=kind, entity_id=run.run_id, payload=payload,
             )
@@ -1245,6 +1252,51 @@ class CommandRuntime:
         }
         return self._success("check", run.paper_id, run.bundle_id, run.run_id, data)
 
+    def _workflow_authority(
+        self, run: Any, capability: dict[str, Any], turn_or_event_id: str | None = None,
+        *, allow_prior_user_turn: bool = False,
+    ) -> HostEvent:
+        """Bind ordinary workflow progress to an actual prompt or protected command.
+
+        Automatic task messages need not emit UserPromptSubmit. A real root
+        PreToolUse receipt can authorize full-scope progress without pretending
+        that a person submitted another prompt. Exclusions and deletion still
+        require their separate observed user approval.
+        """
+        if (capability.get("task_id") != run.task_id or capability.get("agent_id") != "root"
+            or capability.get("status") != "consumed"
+            or capability.get("session_id") != self.state.get_binding(run.task_id).session_id):
+            raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "workflow command lacks current root Main authority")
+        requested = turn_or_event_id if turn_or_event_id is not None else capability["turn_id"]
+        if not isinstance(requested, str):
+            raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "workflow turn must be a string")
+        try:
+            observed = self.state.find_user_turn(task_id=run.task_id, turn_or_event_id=requested)
+        except ReadPaperError as error:
+            if error.code is not ErrorCode.OBSERVER_UNAVAILABLE:
+                raise
+        else:
+            if not allow_prior_user_turn and observed.subject_id != capability["turn_id"]:
+                raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "workflow authority belongs to another turn")
+            return observed
+        if requested != capability["turn_id"]:
+            raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "workflow authority belongs to another turn")
+        path = self.state.layout.host_ledger(run.task_id)
+        matches = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                event = HostEvent.model_validate(json.loads(line))
+                if (event.event_kind is HostEventKind.PRETOOL_AUTHORIZED
+                    and event.semantic_key == capability.get("pretool_semantic_key")
+                    and event.subject_id == capability.get("tool_use_id")
+                    and event.payload.get("actor") == "root_main"
+                    and event.payload.get("request_digest") == capability.get("request_digest")
+                    and event.payload.get("argv_sha256") == capability.get("argv_sha256")):
+                    matches.append(event)
+        if len(matches) != 1:
+            raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "exactly one observed root command is required")
+        return matches[0]
+
     def _run(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
         _, run = self._inventory(invocation.positional[0])
         task_id = str(invocation.flags["--task-id"])
@@ -1261,19 +1313,7 @@ class CommandRuntime:
                     "blocking_ids": check_data["blocking_ids"],
                 },
             )
-        authority = self.state.find_user_turn(
-            task_id=task_id,
-            turn_or_event_id=str(invocation.flags["--user-turn-id"]),
-        )
-        binding = self.state.get_binding(task_id)
-        if (
-            authority.subject_id != capability["turn_id"]
-            or capability["session_id"] != binding.session_id
-        ):
-            raise ReadPaperError(
-                ErrorCode.OBSERVER_UNAVAILABLE,
-                "reading finalization is not bound to the observed current user turn",
-            )
+        authority = self._workflow_authority(run, capability, str(invocation.flags["--user-turn-id"]))
         event = self.state.finalize_reading(
             task_id=task_id,
             paper_id=run.paper_id,
@@ -1306,14 +1346,14 @@ class CommandRuntime:
         task_id = str(invocation.flags["--task-id"])
         client = str(invocation.flags["--client-request-id"])
         if "--begin" in invocation.flags:
-            question_turn = self.state.find_user_turn(task_id=task_id, turn_or_event_id=str(invocation.flags["--user-turn-id"]))
-            if question_turn.subject_id != capability["turn_id"] or capability["session_id"] != self.state.get_binding(task_id).session_id:
-                raise ReadPaperError(ErrorCode.OBSERVER_UNAVAILABLE, "answer begin is not bound to the observed current user turn")
+            question_turn = self._workflow_authority(run, capability, str(invocation.flags["--user-turn-id"]))
+            question_source = "user_prompt" if question_turn.event_kind is HostEventKind.USER_TURN_STARTED else "authorized_command"
             answer = self.state.begin_answer(
                 task_id=task_id, paper_id=run.paper_id, run_id=run.run_id,
                 question_event_id=question_turn.host_event_id,
                 question_turn_id=str(invocation.flags["--user-turn-id"]),
-                question_hash=str(question_turn.payload["prompt_sha256"]),
+                question_hash=str(question_turn.payload["prompt_sha256"] if question_source == "user_prompt" else question_turn.payload["request_digest"]),
+                question_source=question_source,
                 authority_turn_event_id=question_turn.host_event_id,
                 root_main_agent_execution_id=capability["agent_execution_id"], client_request_id=client,
             )
@@ -1346,10 +1386,7 @@ class CommandRuntime:
             final_hash = check_data.get("finalized_content_sha256")
             if not isinstance(final_hash, str):
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "finalized content hash is missing")
-            authority = self.state.find_user_turn(
-                task_id=task_id,
-                turn_or_event_id=str(invocation.flags["--user-turn-id"]),
-            )
+            authority = self._workflow_authority(run, capability, str(invocation.flags["--user-turn-id"]))
             event = self.state.finalize_answer_content(
                 task_id=task_id,
                 paper_id=run.paper_id,

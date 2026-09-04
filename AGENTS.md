@@ -4,6 +4,10 @@ The project-local `readpaper` skill is the sole workflow authority for whole-pap
 
 Use the three project reviewer roles only through their reservation contracts. Reviewers cannot promote root Main coverage or completion. Do not edit `.codex/hooks.json`, `.codex/config.toml`, or the protected `paper.py` command prefix during a run; a changed wiring hash invalidates completion evidence.
 
+## Paper task startup preference
+
+For paper reading in a new session, the user prefers continuing in the existing installed project checkout so hook paths and trust remain consistent. Use a separate worktree only when the user specifically requests it or the task requires isolated code changes. Carry the existing full-paper/report request through automatic continuation without asking the user to repeat it in the new task. Follow the ReadPaper contract for actual command evidence; preserve the separate observed approvals for exclusions and deletion.
+
 ## Korean paper report default
 
 When the user asks to read a paper in this project without narrowing the scope, run the whole-paper ReadPaper workflow first and then produce a complete Korean Markdown report as the initial useful artifact, unless the user explicitly asks for Q&A only, a short summary only, or no report.

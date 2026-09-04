@@ -195,8 +195,8 @@ def test_locator_confirmation_rejects_noncanonical_source(mutation: str, text_ar
         validate_locator_confirmation(payload, data["inventory"])
 
 
-@pytest.mark.parametrize("extension", [None, "txt", "md", "markdown", "rst"])
-def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tmp_path: Path, monkeypatch, extension: str | None) -> None:
+@pytest.mark.parametrize("extension,observed_prompt", [(None, True), ("txt", True), ("md", True), ("markdown", True), ("rst", True), (None, False), ("md", False)])
+def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tmp_path: Path, monkeypatch, extension: str | None, observed_prompt: bool) -> None:
     source_url = None
     if extension:
         source_url = "https://example.org/article"
@@ -209,7 +209,7 @@ def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tm
             content, media = fixtures[url]
             return SimpleNamespace(final_url=url, data=content, content_type=media)
         monkeypatch.setattr("readpaper.commands.fetch_public_url", fetch)
-    runtime, prepared, frame_id, visual_id = prepared_run(tmp_path, source_url=source_url)
+    runtime, prepared, frame_id, visual_id = prepared_run(tmp_path, source_url=source_url, observed_prompt=observed_prompt)
     inventory = json.loads(Path(prepared["data"]["inventory_path"]).read_text())
     page = next(item for item in inventory["pages"] if item["pdf_page"] == (0 if extension else 1))
     frame_id = next(item["frame_id"] for item in inventory["frames"]
@@ -290,13 +290,15 @@ def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tm
     result = command(["answer", run_id, "--finalize", "--answer-id", answer_id, "--task-id", "task", "--user-turn-id", "turn-0"])
     assert result["ok"], result
     stored = runtime.state.get_run(paper_id, run_id).answers[answer_id]
+    assert stored["question_source"] == ("user_prompt" if observed_prompt else "authorized_command")
     assert stored["finalization_record_id"] == replacement["data"]["record_id"]
     assert stored["grounding_record_id"] == checked()["grounding_record_id"]
     assert checked()["decision"] == "allow"
 
     turn_id = "turn-followup"
-    observer.user_prompt({"hook_event_name": "UserPromptSubmit", "session_id": "session", "turn_id": turn_id,
-                          "cwd": str(tmp_path), "prompt": "Explain this result", "task_id": "task"})
+    if observed_prompt:
+        observer.user_prompt({"hook_event_name": "UserPromptSubmit", "session_id": "session", "turn_id": turn_id,
+                              "cwd": str(tmp_path), "prompt": "Explain this result", "task_id": "task"})
     begun = command(["answer", run_id, "--begin", "--task-id", "task", "--user-turn-id", turn_id])
     answer_id, attempt_id = begun["data"]["answer_id"], begun["data"]["response_attempt_id"]
     final_payload.update({"answer_id": answer_id, "response_attempt_id": attempt_id})
@@ -331,3 +333,9 @@ def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tm
     assert command(["answer", run_id, "--finalize", "--answer-id", answer_id, "--task-id", "task", "--user-turn-id", turn_id])["ok"]
     compact_main()
     assert checked()["decision"] == "allow"  # Completed proof is historical, not silently re-bound.
+    if not observed_prompt:
+        host_events = [json.loads(line) for line in runtime.state.layout.host_ledger("task").read_text().splitlines()]
+        assert not any(item["event_kind"] == "user_turn_started" for item in host_events)
+        source = runtime.state.get_run(paper_id, run_id).answers[answer_id]
+        assert source["question_source"] == "authorized_command"
+        assert any(item["host_event_id"] == source["question_event_id"] and item["event_kind"] == "pretool_authorized" for item in host_events)

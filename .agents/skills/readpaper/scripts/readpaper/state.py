@@ -399,6 +399,7 @@ class StateService:
         authority_turn_event_id: str,
         root_main_agent_execution_id: str,
         client_request_id: str,
+        question_source: str = "user_prompt",
     ) -> dict[str, Any]:
         with FileLock(self.layout.reference_lock), FileLock(self.layout.task_lock(task_id)), FileLock(self.layout.run_lock(run_id)):
             self._recover_run(paper_id, run_id)
@@ -441,6 +442,7 @@ class StateService:
                 "question_event_id": question_event_id,
                 "question_turn_id": question_turn_id,
                 "question_hash": question_hash,
+                "question_source": question_source,
                 "current_response_attempt_id": response_attempt_id,
                 "answer_auto_resume_count": 0,
                 "attempts": {
@@ -468,6 +470,7 @@ class StateService:
                     "question_event_id": question_event_id,
                     "question_turn_id": question_turn_id,
                     "question_hash": question_hash,
+                    "question_source": question_source,
                     "response_attempt_id": response_attempt_id,
                     "response_attempt_status": ResponseAttemptStatus.ACTIVE.value,
                     "answer_status": AnswerStatus.DRAFTING.value,

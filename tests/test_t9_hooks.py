@@ -43,14 +43,15 @@ def execute_authorized(runtime: CommandRuntime, argv: list[str], tool: str) -> d
     return json.loads(runtime.execute(invocation))
 
 
-def prepared_run(tmp_path: Path, *, source_url: str | None = None) -> tuple[CommandRuntime, dict, str, str]:
+def prepared_run(tmp_path: Path, *, source_url: str | None = None, observed_prompt: bool = True) -> tuple[CommandRuntime, dict, str, str]:
     runtime = CommandRuntime(tmp_path)
     runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
-    runtime.state.append_host_event(
-        task_id="task", event_kind=HostEventKind.USER_TURN_STARTED,
-        semantic_key="user-turn-0", subject_id="turn-0",
-        payload={"prompt_sha256": digest_text("paper request"), "byte_length": 13},
-    )
+    if observed_prompt:
+        runtime.state.append_host_event(
+            task_id="task", event_kind=HostEventKind.USER_TURN_STARTED,
+            semantic_key="user-turn-0", subject_id="turn-0",
+            payload={"prompt_sha256": digest_text("paper request"), "byte_length": 13},
+        )
     source = tmp_path / "fixture.pdf"
     make_pdf(source)
     prepared = execute_authorized(runtime, ["prepare", source_url or str(source), "--task-id", "task", "--user-turn-id", "turn-0", "--client-request-id", "cr_" + "1" * 32], "bootstrap-prepare")
@@ -61,7 +62,17 @@ def prepared_run(tmp_path: Path, *, source_url: str | None = None) -> tuple[Comm
     payload_dir.mkdir(mode=0o700)
     scope = payload_dir / "scope.json"
     scope.write_text(json.dumps({"scope_kind": "full", "required_artifact_ref_ids": refs, "excluded_artifacts": [], "user_turn_id": "turn-0"}))
-    scoped = execute_authorized(runtime, ["record", run_id, "--kind", "scope_confirmation", "--payload", str(scope), "--client-request-id", "cr_" + "3" * 32], "bootstrap-scope")
+    argv = ["record", run_id, "--kind", "scope_confirmation", "--payload", str(scope), "--client-request-id", "cr_" + "3" * 32]
+    if observed_prompt:
+        scoped = execute_authorized(runtime, argv, "bootstrap-scope")
+    else:
+        observer = DesktopObserver(tmp_path)
+        words = [str(tmp_path / ".venv/bin/python"), str(tmp_path / ".agents/skills/readpaper/scripts/paper.py"), *argv]
+        base = {"session_id": "session", "turn_id": "turn-0", "cwd": str(tmp_path), "tool_name": "Bash",
+                "tool_use_id": "bootstrap-scope", "tool_input": {"command": quote(words)}}
+        assert json.loads(observer.pre_tool({"hook_event_name": "PreToolUse", **base}))["hookSpecificOutput"]["permissionDecision"] == "allow"
+        scoped = json.loads(runtime.execute(parse_argv(argv)))
+        observer.post_tool({"hook_event_name": "PostToolUse", **base, "tool_response": {"output": json.dumps(scoped)}})
     assert scoped["ok"], scoped
     return runtime, prepared, prepared["data"]["transport_frames"][0]["frame_id"], prepared["data"]["visual_units"][0]["unit_id"]
 

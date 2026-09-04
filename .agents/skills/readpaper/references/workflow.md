@@ -2,11 +2,19 @@
 
 All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowercase hex>` client request ID. Retrying an identical lost response uses the same ID; a genuinely new read, render, record, or response attempt uses a new ID.
 
+## Task startup and continuation
+
+Use the existing installed checkout for a new paper-reading task when following this project's user preference for uninterrupted startup. A separate session does not require a separate worktree. If a worktree is explicitly required, inspect the host's effective hook sources and commands before preparation: file existence and installer success do not prove Codex loaded those paths. A worktree may inherit the original checkout's hooks. Diagnose the effective source, enabled state and trust status before asking for hook approval.
+
+Automatic task creation, handoff and follow-up messages may not emit `UserPromptSubmit`. For full scope, reading finalization, answer begin and answer finalization, the command runtime accepts either the observed current user turn or the exact current root Main `PreToolUse` authorization already consumed by the command. The latter is recorded as command authority, never as a synthetic user turn. `question_source=authorized_command` means the question hash identifies the protected request, not user prompt text. Use the actual current host turn ID in the existing `--user-turn-id` field; do not invent an ID. Full-scope payloads may omit `user_turn_id` to use the current command turn.
+
+This route still requires current-session root authority and a matching host receipt for the tool, request and command hashes. It does not relax complete scope, budget, reading coverage, reviewer audits, context or answer-grounding checks. A full scope must include every supported artifact and no exclusions. Reduced scope and deletion retain their explicit observed user approval requirements. Do not ask the user to type the same continuation solely because an automatic message lacks `UserPromptSubmit`; report an actual missing command receipt or other blocker if present.
+
 ## New paper
 
 1. Call `prepare <source> --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Add `--ingest-only` only when the user explicitly wants the paper read now without a report or answer in this turn; ordinary preparation is answer-required.
 2. Inspect the returned artifact list, unsupported items, warnings, section/frame inventory, visual inventory, and residency estimate. If `inventory_inline=false`, obtain section/frame/visual metadata and per-page warnings from `inventory_path`, and the full artifact list including unsupported/excluded candidates from `bundle_manifest_path`, in bounded slices. Full source ranges and hashes live in the inventory; `prepare` returns compact metadata and enforces the serialized envelope limit. Preparation is not reading.
-3. Show the proposed scope. Full scope includes the main paper, references, appendices, and all supported public supplementary items. A reduced scope requires the user's exact exclusion turn and structured excluded refs.
+3. Show the scope and proceed with full scope under the existing paper-reading request. Full scope includes the main paper, references, appendices, and all supported public supplementary items. A reduced scope requires the user's exact exclusion turn and structured excluded refs.
 4. Lock it with `record --kind scope_confirmation`.
 5. Read logical sections in source order. If a section has multiple transport frames, read those frames consecutively in `frame_index` order before moving on. Validate every frame ID, full content hash, source ranges, and all three markers. A truncated or mismatched envelope is a blocker.
 6. Render and actually open every required visual unit. Record the printed-label state for each PDF page after opening it.
