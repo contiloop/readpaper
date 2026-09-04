@@ -45,7 +45,7 @@ Use the independent reviewer contracts in [references/audits.md](references/audi
 
 For every answer, create a new immutable draft for the current response attempt, distinguish paper claims from Main inference and unsupported conclusions, and attach confirmed locators. Apply the fixed scope disclosure as the exact last block when scope is reduced.
 
-All paper answers require current-attempt source reopening and `answer_grounding`, even when the run is already complete. Run flow review when explicitly requested, tutorial-level, interpretively contentious, or at least 1,200 safe-estimated tokens.
+All paper answers require current-attempt source reopening and `answer_grounding`, even when the run is already complete. Before recording finalization/grounding, read [references/grounding.md](references/grounding.md): bind important paper-derived claim groups in the exact final text to confirmed locators and covering reopen events. Record admission and `check` both enforce this evidence chain; a matching content hash alone does not pass. Run flow review when explicitly requested, tutorial-level, interpretively contentious, or at least 1,200 safe-estimated tokens.
 
 Begin an answer before writing answer-specific drafts, running an answer flow audit, recording answer grounding, or finalizing content. An answer attempt is not required for preparation, scope locking, source ingestion, visual inspection, understanding notes, content audits, or a run-only `check`.
 

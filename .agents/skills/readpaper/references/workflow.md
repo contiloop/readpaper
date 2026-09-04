@@ -15,7 +15,7 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 9. Call `check` without an answer ID. Resolve blockers until it returns `reading_ready`.
 10. Call `run <run> --finalize-reading --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Confirm `run_state=read_complete` and `active_run_released=true`; the current run remains available for later answers. This also stores Main's reading-finalization stream/epoch.
 11. If this is an ingest-only run, acknowledge reading completion without making paper-content claims and stop here. Otherwise call `answer <run> --begin ...` before composing the user-facing response.
-12. Draft the answer for the current response attempt, run flow audit when required, remediate, finalize the draft, reopen relevant locators, and record grounding.
+12. Draft the answer for the current response attempt, run flow audit when required, and remediate. Follow [grounding.md](grounding.md) to record exact final content and claim spans, confirm canonical locators, reopen their sources in this attempt/epoch, and bind each claim to the fixed finalization record and observed reopen events.
 13. Call `check --answer-id <answer>`. Resolve blockers until it returns `ready_to_finalize_content`.
 14. Call `answer <run> --finalize --answer-id <answer> ...`. This commits answer-content completion without changing the run's `read_complete` state or claiming UI delivery.
 15. Return the exact finalized content. Stop observation upgrades delivery to `sent_verified`; an unavailable observation remains a nonblocking delivery warning.
@@ -23,6 +23,8 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 ## Follow-up question
 
 Call `answer --begin` on the current `read_complete` run before answer-specific source reopening. Open only the confirmed locations needed for this question in the current attempt and epoch. Create a new draft/finalization/grounding chain, run `check --answer-id`, then `answer --finalize`. Multiple answers may attach to the same completed reading run. Whole-paper coverage and content audits remain inherited for ingest-only runs and answers after the initial report.
+
+The [grounding contract](grounding.md) applies to these answers too: previous-attempt or previous-epoch source opens do not count, and a new finalization record requires new grounding even when its content hash is unchanged.
 
 ## Initial-report context recovery
 

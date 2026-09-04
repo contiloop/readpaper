@@ -33,7 +33,8 @@ def evidence(outcome: str = "rejected") -> dict:
         "role": "math_visual", "findings": [], "recheck_finding_ids": ["finding"],
         "recheck_results": [{"finding_id": "finding", "status": "resolved", "remediation_record_id": "child"}],
     }, 7, "audit_result_recorded", "reviewer")
-    inventory = {"bundle_id": "bundle", "visual_units": [], "frames": [{
+    inventory = {"bundle_id": "bundle", "pages": [{"artifact_ref_id": "ref", "artifact_id": "artifact", "pdf_page": 1, "text": "x" * 100}],
+                 "visual_units": [{"unit_id": "visual", "artifact_ref_id": "ref", "artifact_id": "artifact", "pdf_page": 1}], "frames": [{
         "frame_id": "frame", "content_sha256": "c" * 64,
         "source_ranges": [{"artifact_ref_id": "ref", "artifact_id": "artifact", "pdf_page": 1, "char_start": 0, "char_end": 100}],
     }]}

@@ -506,6 +506,8 @@ class DesktopObserver:
                     "content_sha256": actual_hash,
                     "complete": True,
                     "capability_id": capability["capability_id"],
+                    "answer_id": data.get("answer_id"),
+                    "response_attempt_id": data.get("response_attempt_id"),
                 },
                 idempotency_key=f"posttool:{tool_use}:frame:{frame_id}", source_host_event_id=host.host_event_id,
                 client_request_id=capability["client_request_id"], session_id=capability["session_id"], turn_id=capability["turn_id"],
@@ -549,10 +551,15 @@ class DesktopObserver:
             subject_id=str(path), payload={"path_sha256": digest_text(str(path)), "image_sha256": image_sha, "actual_open": path.is_file()},
         )
         if path.is_file():
+            binding = self.state.get_binding(task_id)
             opened = self.state.append_event(
                 paper_id=paper_id, run_id=run_id, event_kind=EventKind.VISUAL_OPEN_OBSERVED,
                 subject_id=path.stem.rsplit("-", 1)[0], result=EventResult.SUCCEEDED, actor=Actor.ROOT_MAIN,
-                payload={"path_sha256": digest_text(str(path)), "image_sha256": image_sha},
+                payload={
+                    "path_sha256": digest_text(str(path)), "image_sha256": image_sha,
+                    "answer_id": binding.pending_answer_id if binding.current_run_id == run_id else None,
+                    "response_attempt_id": binding.current_response_attempt_id if binding.current_run_id == run_id else None,
+                },
                 idempotency_key=f"visual-open:{payload['tool_use_id']}", source_host_event_id=event.host_event_id,
                 session_id=session, turn_id=turn, agent_execution_id=execution, context_stream_id=stream,
                 context_epoch=self._context_epoch(task_id, stream), tool_use_id=payload["tool_use_id"],

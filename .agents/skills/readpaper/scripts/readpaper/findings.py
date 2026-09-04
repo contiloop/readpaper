@@ -5,12 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
-from .locators import Locator
+from .locators import validate_locator_confirmation
 
 
-LOCATOR_ADAPTER = TypeAdapter(Locator)
 REMEDIATING = {"accepted", "partially_accepted", "modified"}
 
 
@@ -119,8 +118,8 @@ def _validate_disposition(
         if record["payload"].get("locator_id") not in locator_ids:
             continue
         try:
-            locator = LOCATOR_ADAPTER.validate_python(record["payload"].get("locator"))
-        except ValidationError:
+            locator = validate_locator_confirmation(record["payload"], inventory)
+        except (ValueError, KeyError, TypeError):
             continue
         if locator.locator_id != record["payload"].get("locator_id") or locator.bundle_id != inventory["bundle_id"]:
             continue

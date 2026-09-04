@@ -31,6 +31,8 @@ from .documents import (
 )
 from .errors import ErrorCode, ReadPaperError
 from .findings import pending_content_findings
+from .grounding import finalization_claims, observed_record_events, validate_answer_grounding
+from .locators import validate_locator_confirmation
 from .ids import artifact_id, artifact_ref_id, bundle_id, paper_id, sequence_id
 from .models import (
     AnswerStatus,
@@ -503,6 +505,8 @@ class CommandRuntime:
             "context_stream_id": capability["context_stream_id"],
             "context_epoch": capability["context_epoch"],
             "session_epoch": binding.session_epoch,
+            "answer_id": binding.pending_answer_id if binding.current_run_id == run.run_id else None,
+            "response_attempt_id": binding.current_response_attempt_id if binding.current_run_id == run.run_id else None,
         }
         response = self._success("read", run.paper_id, run.bundle_id, run.run_id, data)
         self._enforce_output_budget(response)
@@ -588,6 +592,53 @@ class CommandRuntime:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "record payload must be an object")
+        scoped_inventory = inventory | {"required_artifact_ref_ids": list(run.required_artifact_ref_ids)}
+        if kind == "locator_confirmation":
+            try:
+                validate_locator_confirmation(payload, scoped_inventory)
+            except (ValueError, TypeError, KeyError) as error:
+                raise ReadPaperError(ErrorCode.INVALID_LOCATOR, str(error)) from error
+        if kind in {"explanation_finalized", "answer_grounding"}:
+            if not isinstance(payload.get("answer_id"), str) or not isinstance(payload.get("response_attempt_id"), str):
+                raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "answer evidence requires answer_id and response_attempt_id")
+            binding = self.state.get_binding(run.task_id)
+            answer = run.answers.get(payload.get("answer_id"), {})
+            attempt_id = answer.get("current_response_attempt_id")
+            execution = answer.get("attempts", {}).get(attempt_id, {}).get("root_main_agent_execution_id")
+            if (not answer or payload.get("answer_id") != binding.pending_answer_id
+                or payload.get("response_attempt_id") != binding.current_response_attempt_id
+                or payload.get("response_attempt_id") != attempt_id
+                or answer.get("answer_status") != AnswerStatus.DRAFTING.value
+                or execution != capability["agent_execution_id"]):
+                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "answer evidence requires the current active root Main response attempt")
+            if kind == "explanation_finalized":
+                try:
+                    finalization_claims(payload)
+                except (ValueError, TypeError) as error:
+                    raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, str(error)) from error
+            else:
+                records, events = self._evidence(run)
+                finalizations = [item for item in records if item["record_kind"] == "explanation_finalized"
+                                 and item["payload"].get("answer_id") == payload["answer_id"]
+                                 and item["payload"].get("response_attempt_id") == attempt_id]
+                event_order = {key: item["event_seq"] for key, item in observed_record_events(events).items()}
+                final = max(finalizations, key=lambda item: event_order.get(item["record_id"], 0), default=None)
+                stream, epoch = self._current_main_context(run)
+                candidate = {"record_id": "candidate-grounding", "record_kind": kind, "payload": payload}
+                candidate_event = {
+                    "event_id": "candidate-grounding-event", "event_seq": run.event_seq + 1,
+                    "event_kind": "answer_grounded", "actor": "root_main", "result": "succeeded",
+                    "agent_execution_id": capability["agent_execution_id"],
+                    "context_stream_id": capability["context_stream_id"], "context_epoch": capability["context_epoch"],
+                    "payload": {"record_id": candidate["record_id"]},
+                }
+                validation = validate_answer_grounding(
+                    grounding_record=candidate, finalization_record=final, answer=answer,
+                    records=records, events=[*events, candidate_event], inventory=scoped_inventory,
+                    current_context_stream_id=stream, current_context_epoch=epoch,
+                )
+                if not validation.valid:
+                    raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "answer grounding evidence is invalid", details={"blocking_ids": list(validation.blocker_ids)})
         if kind == "scope_confirmation":
             try:
                 scope_kind = ScopeKind(payload["scope_kind"])
@@ -800,6 +851,21 @@ class CommandRuntime:
                 "session_epoch": self.state.get_binding(run.task_id).session_epoch,
             },
         )
+
+    def _evidence(self, run: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        records = [read_json(path) for path in self.state.layout.run_records(run.paper_id, run.run_id).glob("rec_*.json")]
+        events = [json.loads(line) for line in self.state.layout.run_events(run.paper_id, run.run_id).read_text().splitlines()]
+        return records, events
+
+    def _current_main_context(self, run: Any) -> tuple[str, int]:
+        binding = self.state.get_binding(run.task_id)
+        stream = sequence_id("ctx", run.task_id, binding.session_id, "root")
+        path = self.state.layout.host_state(run.task_id)
+        host = read_json(path) if path.exists() else {}
+        compact = host.get("compact_streams", {}).get(stream, {})
+        if compact.get("open") is not None:
+            raise ReadPaperError(ErrorCode.STATE_CONFLICT, "Main context compaction is in progress")
+        return stream, int(compact.get("context_epoch", 0))
 
     def _check(self, invocation: Invocation, capability: None) -> dict[str, Any]:
         inventory, run = self._inventory(invocation.positional[0])
@@ -1015,6 +1081,8 @@ class CommandRuntime:
         response_attempt_id = None
         response_attempt_status = None
         answer_delivery_state = None
+        grounding_record_id = None
+        finalization_record_id = None
         if answer_id is not None:
             answer = run.answers.get(answer_id)
             if not isinstance(answer, dict):
@@ -1029,41 +1097,45 @@ class CommandRuntime:
                 if item["payload"].get("answer_id") == answer_id
                 and item["payload"].get("response_attempt_id") == response_attempt_id
             ]
-            finalizations.sort(key=lambda item: str(item.get("created_at", "")))
+            event_order = {key: item["event_seq"] for key, item in observed_record_events(all_events).items()}
+            finalizations.sort(key=lambda item: event_order.get(item["record_id"], 0))
+            if answer.get("finalization_record_id"):
+                finalizations = [item for item in finalizations if item["record_id"] == answer["finalization_record_id"]]
             finalized = bool(finalizations)
             if finalized:
                 finalized_content_sha256 = finalizations[-1]["payload"].get("final_content_sha256")
+                finalization_record_id = finalizations[-1]["record_id"]
             groundings = [
                 item
                 for item in record_kinds.get("answer_grounding", [])
                 if item["payload"].get("answer_id") == answer_id
                 and item["payload"].get("response_attempt_id") == response_attempt_id
             ]
-            if initial_answer_context_required:
-                current_grounding_ids = {
-                    event.get("payload", {}).get("record_id") for event in all_events
-                    if event.get("event_kind") == "answer_grounded"
-                    and event.get("actor") == "root_main" and event.get("result") == "succeeded"
-                    and event.get("context_stream_id") == main_context_stream_id
-                    and event.get("context_epoch") == main_context_epoch
-                }
-                groundings = [item for item in groundings if item["record_id"] in current_grounding_ids]
-            matching_grounding = any(
-                item["payload"].get("final_content_sha256") == finalized_content_sha256
-                for item in groundings
-            )
             content_terminal = answer_status in {
                 AnswerStatus.CONTENT_FINALIZED.value,
                 AnswerStatus.SENT_VERIFIED.value,
                 AnswerStatus.DELIVERY_UNKNOWN.value,
             }
-            if not content_terminal:
-                if not finalized:
-                    blockers.append("answer_not_finalized")
-                if not groundings:
-                    blockers.append("answer_not_grounded")
-                elif not matching_grounding:
-                    blockers.append("answer_grounding_hash_mismatch")
+            if answer.get("grounding_record_id"):
+                groundings = [item for item in groundings if item["record_id"] == answer["grounding_record_id"]]
+            if not finalized:
+                blockers.append("answer_not_finalized")
+            if not groundings:
+                blockers.append("answer_not_grounded")
+            else:
+                groundings.sort(key=lambda item: event_order.get(item["record_id"], 0), reverse=True)
+                validations = [(item, validate_answer_grounding(
+                    grounding_record=item, finalization_record=finalizations[-1] if finalized else None,
+                    answer=answer, records=[record for group in record_kinds.values() for record in group],
+                    events=all_events, inventory=inventory | {"required_artifact_ref_ids": list(run.required_artifact_ref_ids)},
+                    current_context_stream_id=answer.get("grounded_context_stream_id", main_context_stream_id) if content_terminal else main_context_stream_id,
+                    current_context_epoch=answer.get("grounded_context_epoch", main_context_epoch) if content_terminal else main_context_epoch,
+                )) for item in groundings]
+                valid = next((item for item, validation in validations if validation.valid), None)
+                if valid is not None:
+                    grounding_record_id = valid["record_id"]
+                else:
+                    blockers.extend(validations[0][1].blocker_ids)
             stored_content_hash = answer.get("final_content_sha256")
             if content_terminal and stored_content_hash != finalized_content_sha256:
                 blockers.append("answer_content_hash_mismatch")
@@ -1157,6 +1229,8 @@ class CommandRuntime:
             "answer_auto_resume_count": binding.answer_auto_resume_counts.get(answer_id, 0) if answer_id else None,
             "answer_delivery_state": answer_delivery_state,
             "finalized_content_sha256": finalized_content_sha256,
+            "finalization_record_id": finalization_record_id,
+            "grounding_record_id": grounding_record_id,
             "checked_event_seq": run.event_seq,
             "content_completion_state": (
                 "finalized" if answer_status in {
@@ -1281,6 +1355,10 @@ class CommandRuntime:
                 answer_id=answer_id,
                 final_content_sha256=final_hash,
                 expected_event_seq=int(check_data["checked_event_seq"]),
+                expected_context_stream_id=check_data["main_context_stream_id"],
+                expected_context_epoch=check_data["main_context_epoch"],
+                finalization_record_id=check_data["finalization_record_id"],
+                grounding_record_id=check_data["grounding_record_id"],
                 authority_host_event_id=authority.host_event_id,
                 committed_by_agent_execution_id=capability["agent_execution_id"],
                 client_request_id=client,

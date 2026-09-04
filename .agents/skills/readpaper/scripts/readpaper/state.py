@@ -503,6 +503,10 @@ class StateService:
         authority_host_event_id: str,
         committed_by_agent_execution_id: str,
         client_request_id: str,
+        expected_context_stream_id: str | None = None,
+        expected_context_epoch: int | None = None,
+        finalization_record_id: str | None = None,
+        grounding_record_id: str | None = None,
     ) -> RunEvent:
         """Commit content completion without claiming that Desktop delivered it."""
 
@@ -528,6 +532,8 @@ class StateService:
                     "content can finalize only after reading is complete",
                 )
             self._require_initial_answer_context(run, binding, answer_id)
+            if expected_context_stream_id is not None and self._main_context(binding) != (expected_context_stream_id, expected_context_epoch):
+                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "Main context changed after the grounding check")
             response_id = answer["current_response_attempt_id"]
             if response_id != binding.current_response_attempt_id:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "response attempt binding changed")
@@ -554,6 +560,10 @@ class StateService:
                     "delivery_status": "pending_observation",
                     "final_content_sha256": final_content_sha256,
                     "attempts": attempts,
+                    "finalization_record_id": finalization_record_id,
+                    "grounding_record_id": grounding_record_id,
+                    "grounded_context_stream_id": expected_context_stream_id,
+                    "grounded_context_epoch": expected_context_epoch,
                 }
             )
             answers = dict(run.answers)
@@ -569,6 +579,10 @@ class StateService:
                     "answer_id": answer_id,
                     "response_attempt_id": response_id,
                     "final_content_sha256": final_content_sha256,
+                    "finalization_record_id": finalization_record_id,
+                    "grounding_record_id": grounding_record_id,
+                    "grounded_context_stream_id": expected_context_stream_id,
+                    "grounded_context_epoch": expected_context_epoch,
                     "content_status": "finalized",
                     "delivery_status": "pending_observation",
                     "run_from": run.state.value,
