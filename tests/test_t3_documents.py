@@ -175,6 +175,43 @@ def test_decimal_and_punctuated_appendix_headings_are_recognized() -> None:
     )
 
 
+@pytest.mark.parametrize("source_kind", ["pdf", "text"])
+@pytest.mark.parametrize("blank_lines", [False, True])
+def test_prose_does_not_split_method_section(tmp_path: Path, source_kind: str, blank_lines: bool) -> None:
+    lines = [
+        "3 Method",
+        "We train the model for 100 epochs.",
+        "A simple baseline is used for comparison",
+        "I propose a simple alternative",
+        "V denotes the vocabulary size",
+        "1 We evaluate the baseline on two datasets",
+        "2024 was a significant year for this method",
+        "The vocabulary is shared across encoders.",
+        "4 Experiments",
+        "We report the evaluation results.",
+    ]
+    if source_kind == "pdf":
+        path = tmp_path / "prose.pdf"
+        document = canvas.Canvas(str(path), pagesize=letter)
+        for index, line in enumerate(lines):
+            document.drawString(72, 740 - index * (36 if blank_lines else 12), line)
+        document.showPage()
+        document.save()
+        data = path.read_bytes()
+        extract = extract_pdf
+    else:
+        data = ("\n\n" if blank_lines else "\n").join(lines).encode()
+        extract = extract_text
+    _, artifact, ref, bundle = identities(data)
+    result = extract(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
+    assert [section.title for section in result.sections] == ["3 Method", "4 Experiments"]
+    method = materialize_source_ranges(result.pages, result.sections[0].source_ranges, include_page_markers=False)
+    assert all(line in method for line in lines[:8])
+    reconstructed = "".join(materialize_source_ranges(result.pages, section.source_ranges, include_page_markers=False)
+                            for section in result.sections)
+    assert reconstructed == result.pages[0].text
+
+
 def test_large_section_uses_multiple_transport_frames_without_overlap() -> None:
     text = "A long methodological paragraph with evidence.\n\n" * 2_000
     artifact = artifact_id(text.encode())

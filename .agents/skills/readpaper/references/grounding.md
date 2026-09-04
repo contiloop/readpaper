@@ -51,6 +51,8 @@ For a text-span locator, cited frames must collectively cover its entire charact
 
 `RENDER_CREATED` records the resolved output path's SHA-256 along with its unit ID, image hash and pixel metadata. The visual observer accepts only a successful root Main open whose resolved path and current file hash match the latest successful protected render at that path. The observation takes its unit ID from that render and records both `render_id` and the exact `render_event_id`; filenames carry no authority. A replaced image, an arbitrary `<unit-id>-fake.png`, or a copy at a different path provides no visual coverage.
 
+PDF and standalone-image renders are validated in a private temporary directory inside the output directory before publication. Existing output symlinks, nonregular files and multiply linked files are rejected. A validated raster is published with mode `0600` using atomic replacement, so writing never follows a destination symlink; validation failures preserve the previous output and emit no render evidence.
+
 Reading checks, grounding and finding dispositions revalidate this linkage against the render preceding the open. A later render does not invalidate a previously valid historical open. Legacy visual observations without this linkage do not count; render and open the relevant units again, then reground any affected pending answer. This checks the file bytes observed by the post-tool hook against the protected render record; it is not an independent attestation of the host's displayed pixels or protection against arbitrary modification of the event store.
 
 ## Bind claims to the fixed finalization

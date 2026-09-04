@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from pypdf import PdfReader
 from .canonical import digest_text, sha256_bytes
 from .errors import ErrorCode, ReadPaperError
 from .ids import sequence_id
+from .storage import assert_regular_private_file, ensure_private_directory, fsync_directory
 
 
 MAX_PDF_PAGES = 200
@@ -957,13 +959,31 @@ def _validate_image(path: Path, *, dpi: int | None) -> RenderedImage:
     )
 
 
+def _publish_render(rendered: Path, *, output: Path, dpi: int | None) -> RenderedImage:
+    """Validate a private temporary raster, then replace a regular destination."""
+    rendered.chmod(0o600)
+    result = _validate_image(rendered, dpi=dpi)
+    try:
+        assert_regular_private_file(output)
+    except FileNotFoundError:
+        pass
+    except ReadPaperError as error:
+        raise ReadPaperError(error.code, "render destination must be one private regular file") from error
+    with rendered.open("rb") as handle:
+        os.fsync(handle.fileno())
+    # replace never follows a destination symlink, even if one appears after lstat.
+    os.replace(rendered, output)
+    fsync_directory(output.parent)
+    return replace(result, path=output)
+
+
 def render_pdf_page(source: Path, *, pdf_page: int, output: Path, dpi: int = 144) -> RenderedImage:
     if not 72 <= dpi <= 600 or pdf_page < 1:
         raise ReadPaperError(ErrorCode.INVALID_ARGUMENT, "invalid page or DPI")
     executable = shutil.which("pdftoppm")
     if executable is None:
         raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "pdftoppm is unavailable")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(output.parent)
     with tempfile.TemporaryDirectory(prefix="readpaper-render-", dir=output.parent) as directory:
         prefix = Path(directory) / "page"
         command = [
@@ -978,13 +998,11 @@ def render_pdf_page(source: Path, *, pdf_page: int, output: Path, dpi: int = 144
         rendered = prefix.with_suffix(".png")
         if completed.returncode != 0 or not rendered.is_file():
             raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, "pdftoppm failed")
-        result = _validate_image(rendered, dpi=dpi)
-        output.write_bytes(rendered.read_bytes())
-    return _validate_image(output, dpi=dpi)
+        return _publish_render(rendered, output=output, dpi=dpi)
 
 
 def render_image(source: Path, *, output: Path) -> RenderedImage:
-    output.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(output.parent)
     try:
         with Image.open(source) as opened:
             if getattr(opened, "n_frames", 1) != 1:
@@ -993,9 +1011,11 @@ def render_image(source: Path, *, output: Path) -> RenderedImage:
             width, height = image.size
             if width > MAX_RASTER_AXIS or height > MAX_RASTER_AXIS or width * height > MAX_RASTER_PIXELS:
                 raise ReadPaperError(ErrorCode.OUTPUT_BUDGET_EXCEEDED, "raster dimensions are unsafe")
-            image.save(output, format="PNG", optimize=False)
+            with tempfile.TemporaryDirectory(prefix="readpaper-render-", dir=output.parent) as directory:
+                rendered = Path(directory) / "image.png"
+                image.save(rendered, format="PNG", optimize=False)
+                return _publish_render(rendered, output=output, dpi=None)
     except ReadPaperError:
         raise
     except Exception as error:
         raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, "image decode failed") from error
-    return _validate_image(output, dpi=None)
