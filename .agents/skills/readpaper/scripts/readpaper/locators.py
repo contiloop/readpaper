@@ -8,6 +8,7 @@ from pydantic import Field, TypeAdapter, model_validator
 
 from .canonical import digest, digest_text
 from .models import StrictModel
+from .visual_evidence import validated_visual_unit
 
 
 class LocatorBase(StrictModel):
@@ -30,18 +31,25 @@ class PdfPageLocator(LocatorBase):
     pdf_page: int = Field(ge=1)
 
 
-class TextSpanLocator(LocatorBase):
-    locator_kind: Literal["text_span"] = "text_span"
-    pdf_page: int = Field(ge=1)
+class TextRangeLocator(LocatorBase):
     char_start: int = Field(ge=0)
     char_end: int = Field(gt=0)
     content_sha256: str
 
     @model_validator(mode="after")
-    def ordered(self) -> "TextSpanLocator":
+    def ordered(self) -> "TextRangeLocator":
         if self.char_end <= self.char_start:
             raise ValueError("text span must be non-empty")
         return self
+
+
+class TextSpanLocator(TextRangeLocator):
+    locator_kind: Literal["text_span"] = "text_span"
+    pdf_page: int = Field(ge=1)
+
+
+class TextArtifactSpanLocator(TextRangeLocator):
+    locator_kind: Literal["text_artifact_span"] = "text_artifact_span"
 
 
 class PdfObjectLocator(LocatorBase):
@@ -72,7 +80,7 @@ class ImageRegionLocator(LocatorBase):
 
 
 Locator = Annotated[
-    Union[PdfPageLocator, TextSpanLocator, PdfObjectLocator, ImageRegionLocator],
+    Union[PdfPageLocator, TextSpanLocator, TextArtifactSpanLocator, PdfObjectLocator, ImageRegionLocator],
     Field(discriminator="locator_kind"),
 ]
 
@@ -94,13 +102,14 @@ def validate_locator_confirmation(payload: dict[str, Any], inventory: dict[str, 
         if locator.artifact_id != f"a_{locator.image_sha256}":
             raise ValueError("image hash does not match the source artifact")
         return locator
+    pdf_page = 0 if isinstance(locator, TextArtifactSpanLocator) else locator.pdf_page
     page = next((item for item in inventory["pages"] if (
         item["artifact_ref_id"] == locator.artifact_ref_id and item["artifact_id"] == locator.artifact_id
-        and item["pdf_page"] == locator.pdf_page
+        and item["pdf_page"] == pdf_page
     )), None)
     if page is None:
         raise ValueError("page is not in the source inventory")
-    if isinstance(locator, TextSpanLocator):
+    if isinstance(locator, TextRangeLocator):
         text = page["text"]
         if locator.char_end > len(text) or digest_text(text[locator.char_start:locator.char_end]) != locator.content_sha256:
             raise ValueError("text span bounds or hash do not match canonical page text")
@@ -110,19 +119,21 @@ def validate_locator_confirmation(payload: dict[str, Any], inventory: dict[str, 
     return locator
 
 
-def reopened_sources_cover(locator: LocatorBase, events: list[dict[str, Any]], inventory: dict[str, Any]) -> bool:
+def reopened_sources_cover(
+    locator: LocatorBase, events: list[dict[str, Any]], inventory: dict[str, Any],
+    *, all_events: list[dict[str, Any]],
+) -> bool:
     """Require a full page/image open or gapless text coverage, possibly across frames."""
-    if not isinstance(locator, TextSpanLocator):
+    if not isinstance(locator, TextRangeLocator):
         for event in events:
-            if event.get("event_kind") != "visual_open_observed":
-                continue
-            if any(item["unit_id"] == event.get("subject_id") and item["artifact_ref_id"] == locator.artifact_ref_id
-                   and item["artifact_id"] == locator.artifact_id
-                   and item.get("pdf_page") == getattr(locator, "pdf_page", None)
-                   for item in inventory["visual_units"]):
+            unit = validated_visual_unit(event, all_events, inventory)
+            if (unit is not None and unit["artifact_ref_id"] == locator.artifact_ref_id
+                and unit["artifact_id"] == locator.artifact_id
+                and unit.get("pdf_page") == getattr(locator, "pdf_page", None)):
                 return True
-    if not isinstance(locator, (TextSpanLocator, PdfPageLocator)):
+    if not isinstance(locator, (TextRangeLocator, PdfPageLocator)):
         return False
+    pdf_page = 0 if isinstance(locator, TextArtifactSpanLocator) else locator.pdf_page
     ranges = []
     frame_map = {item["frame_id"]: item for item in inventory["frames"]}
     for event in events:
@@ -133,9 +144,9 @@ def reopened_sources_cover(locator: LocatorBase, events: list[dict[str, Any]], i
             continue
         ranges.extend((item["char_start"], item["char_end"]) for item in frame["source_ranges"] if (
             item["artifact_ref_id"] == locator.artifact_ref_id and item["artifact_id"] == locator.artifact_id
-            and item["pdf_page"] == locator.pdf_page
+            and item["pdf_page"] == pdf_page
         ))
-    if isinstance(locator, TextSpanLocator):
+    if isinstance(locator, TextRangeLocator):
         start, end = locator.char_start, locator.char_end
     else:
         page = next(item for item in inventory["pages"] if item["artifact_ref_id"] == locator.artifact_ref_id

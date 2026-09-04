@@ -15,6 +15,7 @@ from .models import Actor, EventKind, EventResult, HostEventKind, RunState
 from .parse_invocation import SCHEMA_SHA256, Invocation, parse_command
 from .state import StateService
 from .storage import FileLock, assert_regular_private_file, atomic_write_json, read_json
+from .visual_evidence import matching_render
 
 
 HOOK_DEFINITION = "readpaper-observer/v2"
@@ -544,28 +545,40 @@ class DesktopObserver:
             return b""
         execution = sequence_id("ae", task_id, session, turn, "root")
         stream = sequence_id("ctx", task_id, session, "root")
-        image_sha = sha256_bytes(path.read_bytes()) if path.is_file() else None
+        try:
+            image_sha = sha256_bytes(path.read_bytes())
+        except OSError:
+            return b""
+        path_sha = digest_text(str(path))
+        events = [json.loads(line) for line in self.state.layout.run_events(paper_id, run_id).read_text().splitlines()]
+        render = matching_render(events, path_sha256=path_sha, image_sha256=image_sha)
+        if render is None:
+            return b""
+        inventory = read_json(self.state.layout.run_dir(paper_id, run_id) / "inventory.json")
+        unit_id = render["payload"].get("unit_id")
+        if not any(unit["unit_id"] == unit_id for unit in inventory["visual_units"]):
+            return b""
         event = self.state.append_host_event(
             task_id=task_id, event_kind=HostEventKind.TOOL_COMPLETED,
             semantic_key=digest({"kind": "PostToolUse/v1", "session_id": session, "turn_id": turn, "tool_use_id": payload["tool_use_id"], "tool_name": "view_image"}),
-            subject_id=str(path), payload={"path_sha256": digest_text(str(path)), "image_sha256": image_sha, "actual_open": path.is_file()},
+            subject_id=str(path), payload={"path_sha256": path_sha, "image_sha256": image_sha, "actual_open": True},
         )
-        if path.is_file():
-            binding = self.state.get_binding(task_id)
-            opened = self.state.append_event(
-                paper_id=paper_id, run_id=run_id, event_kind=EventKind.VISUAL_OPEN_OBSERVED,
-                subject_id=path.stem.rsplit("-", 1)[0], result=EventResult.SUCCEEDED, actor=Actor.ROOT_MAIN,
-                payload={
-                    "path_sha256": digest_text(str(path)), "image_sha256": image_sha,
-                    "answer_id": binding.pending_answer_id if binding.current_run_id == run_id else None,
-                    "response_attempt_id": binding.current_response_attempt_id if binding.current_run_id == run_id else None,
-                },
-                idempotency_key=f"visual-open:{payload['tool_use_id']}", source_host_event_id=event.host_event_id,
-                session_id=session, turn_id=turn, agent_execution_id=execution, context_stream_id=stream,
-                context_epoch=self._context_epoch(task_id, stream), tool_use_id=payload["tool_use_id"],
-            )
-            from .stop import StopCoordinator
-            StopCoordinator(self.root).observe_visual_repair(task_id=task_id, image_path=str(path), image_sha256=str(image_sha), event=opened)
+        binding = self.state.get_binding(task_id)
+        opened = self.state.append_event(
+            paper_id=paper_id, run_id=run_id, event_kind=EventKind.VISUAL_OPEN_OBSERVED,
+            subject_id=unit_id, result=EventResult.SUCCEEDED, actor=Actor.ROOT_MAIN,
+            payload={
+                "path_sha256": path_sha, "image_sha256": image_sha,
+                "render_id": render["subject_id"], "render_event_id": render["event_id"],
+                "answer_id": binding.pending_answer_id if binding.current_run_id == run_id else None,
+                "response_attempt_id": binding.current_response_attempt_id if binding.current_run_id == run_id else None,
+            },
+            idempotency_key=f"visual-open:{payload['tool_use_id']}", source_host_event_id=event.host_event_id,
+            session_id=session, turn_id=turn, agent_execution_id=execution, context_stream_id=stream,
+            context_epoch=self._context_epoch(task_id, stream), tool_use_id=payload["tool_use_id"],
+        )
+        from .stop import StopCoordinator
+        StopCoordinator(self.root).observe_visual_repair(task_id=task_id, image_path=str(path), image_sha256=image_sha, event=opened)
         return b""
 
     def session_start(self, payload: dict[str, Any]) -> bytes:

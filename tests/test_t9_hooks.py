@@ -43,7 +43,7 @@ def execute_authorized(runtime: CommandRuntime, argv: list[str], tool: str) -> d
     return json.loads(runtime.execute(invocation))
 
 
-def prepared_run(tmp_path: Path) -> tuple[CommandRuntime, dict, str, str]:
+def prepared_run(tmp_path: Path, *, source_url: str | None = None) -> tuple[CommandRuntime, dict, str, str]:
     runtime = CommandRuntime(tmp_path)
     runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
     runtime.state.append_host_event(
@@ -53,14 +53,16 @@ def prepared_run(tmp_path: Path) -> tuple[CommandRuntime, dict, str, str]:
     )
     source = tmp_path / "fixture.pdf"
     make_pdf(source)
-    prepared = execute_authorized(runtime, ["prepare", str(source), "--task-id", "task", "--user-turn-id", "turn-0", "--client-request-id", "cr_" + "1" * 32], "bootstrap-prepare")
+    prepared = execute_authorized(runtime, ["prepare", source_url or str(source), "--task-id", "task", "--user-turn-id", "turn-0", "--client-request-id", "cr_" + "1" * 32], "bootstrap-prepare")
+    assert prepared["ok"], prepared
     run_id = prepared["run_id"]
-    ref = prepared["data"]["artifacts"][0]["artifact_ref_id"]
+    refs = [item["artifact_ref_id"] for item in prepared["data"]["artifacts"] if item["support_state"] == "supported"]
     payload_dir = tmp_path / "payloads"
     payload_dir.mkdir(mode=0o700)
     scope = payload_dir / "scope.json"
-    scope.write_text(json.dumps({"scope_kind": "full", "required_artifact_ref_ids": [ref], "excluded_artifacts": [], "user_turn_id": "turn-0"}))
-    execute_authorized(runtime, ["record", run_id, "--kind", "scope_confirmation", "--payload", str(scope), "--client-request-id", "cr_" + "3" * 32], "bootstrap-scope")
+    scope.write_text(json.dumps({"scope_kind": "full", "required_artifact_ref_ids": refs, "excluded_artifacts": [], "user_turn_id": "turn-0"}))
+    scoped = execute_authorized(runtime, ["record", run_id, "--kind", "scope_confirmation", "--payload", str(scope), "--client-request-id", "cr_" + "3" * 32], "bootstrap-scope")
+    assert scoped["ok"], scoped
     return runtime, prepared, prepared["data"]["transport_frames"][0]["frame_id"], prepared["data"]["visual_units"][0]["unit_id"]
 
 
@@ -637,6 +639,13 @@ def test_stop_visual_repair_completes_only_after_image_is_opened(tmp_path: Path)
     }
     observer.post_tool(open_payload | {"tool_response": {"isError": True}})
     assert stop._transactions("task")[0][1]["attempt_status"] == "awaiting_visual_open"
+    image_path = Path(rendered["data"]["path"])
+    original_image = image_path.read_bytes()
+    from PIL import Image
+    Image.new("RGB", (8, 8), "red").save(image_path)
+    observer.post_tool(open_payload)
+    assert stop._transactions("task")[0][1]["attempt_status"] == "awaiting_visual_open"
+    image_path.write_bytes(original_image)
     observer.post_tool(open_payload)
     transaction = stop._transactions("task")[0][1]
     assert transaction["attempt_status"] == "completed"

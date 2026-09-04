@@ -177,6 +177,6 @@ def validate_answer_grounding(
                 blockers.add(f"answer_grounding_locator_invalid:{locator_id}")
             elif not fresh:
                 blockers.add(f"answer_grounding_reopen_missing:{locator_id}")
-            elif not any(reopened_sources_cover(locator, fresh, inventory) for locator in confirmed):
+            elif not any(reopened_sources_cover(locator, fresh, inventory, all_events=events) for locator in confirmed):
                 blockers.add(f"answer_grounding_reopen_does_not_cover:{locator_id}")
     return result()

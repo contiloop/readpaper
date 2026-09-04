@@ -29,9 +29,29 @@ Offsets are Python Unicode character offsets, start-inclusive/end-exclusive, not
 
 Record `locator_confirmation` with the canonical `locator_id` and full `locator` union object. Confirmation validates bundle, artifact/ref, locked scope and page/image membership. A text span's bounds and hash must match the canonical page text in the inventory. Invalid confirmations return `INVALID_LOCATOR` without emitting a confirmation event.
 
+Use `text_span` with a 1-based `pdf_page` for extracted PDF text. Supported `.txt`, `.md`, `.markdown` and `.rst` supplementary prose uses `text_artifact_span`, which has no `pdf_page` field:
+
+```json
+{
+  "bundle_id": "<bundle_id>",
+  "artifact_ref_id": "<supplement_ref_id>",
+  "artifact_id": "<supplement_artifact_id>",
+  "locator_kind": "text_artifact_span",
+  "char_start": 0,
+  "char_end": 42,
+  "content_sha256": "<hash of canonical text[0:42]>"
+}
+```
+
+Both span kinds use Unicode character offsets and exact canonical text hashes. The text-artifact locator resolves to the inventory's internal page-zero text; do not add that sentinel to the public locator. It cannot resolve to a PDF page. Its artifact/ref must belong to the locked scope, and its reopened frames must cover the entire span without gaps. The same rules apply to audit-finding dispositions.
+
 After `answer --begin` or the current `answer --resume`, reopen the needed source with protected `read` calls or successful `view_image` opens. Use observer-generated `SOURCE_FRAME_EMITTED` / `VISUAL_OPEN_OBSERVED` event IDs from this run's `events.jsonl`; do not invent them or substitute a `RENDER_CREATED` event. The observer binds each reopen to its answer/attempt, root execution and stream/epoch.
 
 For a text-span locator, cited frames must collectively cover its entire character range without gaps and match the inventory frame hashes. A page locator requires its entire canonical page text or a page-image open; an empty/scanned page requires visual opening. Object and image-region locators require opening the corresponding visual, not just nearby extracted text. Rendering alone never counts.
+
+`RENDER_CREATED` records the resolved output path's SHA-256 along with its unit ID, image hash and pixel metadata. The visual observer accepts only a successful root Main open whose resolved path and current file hash match the latest successful protected render at that path. The observation takes its unit ID from that render and records both `render_id` and the exact `render_event_id`; filenames carry no authority. A replaced image, an arbitrary `<unit-id>-fake.png`, or a copy at a different path provides no visual coverage.
+
+Reading checks, grounding and finding dispositions revalidate this linkage against the render preceding the open. A later render does not invalidate a previously valid historical open. Legacy visual observations without this linkage do not count; render and open the relevant units again, then reground any affected pending answer. This checks the file bytes observed by the post-tool hook against the protected render record; it is not an independent attestation of the host's displayed pixels or protection against arbitrary modification of the event store.
 
 ## Bind claims to the fixed finalization
 

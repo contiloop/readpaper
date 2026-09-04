@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .locators import validate_locator_confirmation
+from .locators import reopened_sources_cover, validate_locator_confirmation
 
 
 REMEDIATING = {"accepted", "partially_accepted", "modified"}
@@ -15,30 +15,6 @@ REMEDIATING = {"accepted", "partially_accepted", "modified"}
 
 def _root(event: dict[str, Any] | None, kind: str) -> bool:
     return bool(event and event.get("actor") == "root_main" and event.get("result") == "succeeded" and event.get("event_kind") == kind)
-
-
-def _covers(locator: dict[str, Any], event: dict[str, Any], inventory: dict[str, Any]) -> bool:
-    ref = locator["artifact_ref_id"]
-    artifact = locator["artifact_id"]
-    kind = locator["locator_kind"]
-    if event.get("event_kind") == "visual_open_observed":
-        return any(
-            item["unit_id"] == event["subject_id"] and item["artifact_ref_id"] == ref
-            and item["artifact_id"] == artifact
-            and (item.get("pdf_page") == locator.get("pdf_page"))
-            for item in inventory["visual_units"]
-        ) and kind != "text_span"
-    if kind not in {"text_span", "pdf_page"}:
-        return False
-    frame = next((item for item in inventory["frames"] if item["frame_id"] == event.get("subject_id")), None)
-    if frame is None or event.get("payload", {}).get("content_sha256") != frame["content_sha256"]:
-        return False
-    return any(
-        item["artifact_ref_id"] == ref and item["artifact_id"] == artifact
-        and item["pdf_page"] == locator["pdf_page"]
-        and (kind == "pdf_page" or (item["char_start"] <= locator["char_start"] and item["char_end"] >= locator["char_end"]))
-        for item in frame["source_ranges"]
-    )
 
 
 def pending_content_findings(
@@ -123,7 +99,7 @@ def _validate_disposition(
             continue
         if locator.locator_id != record["payload"].get("locator_id") or locator.bundle_id != inventory["bundle_id"]:
             continue
-        confirmations[locator.locator_id] = locator.model_dump()
+        confirmations[locator.locator_id] = locator
     if not locator_ids <= confirmations.keys():
         return "confirmed_locator_missing"
     reopens = [by_event.get(key, {}) for key in payload.get("source_reopen_event_ids", [])]
@@ -133,7 +109,8 @@ def _validate_disposition(
         and item.get("context_stream_id") == event.get("context_stream_id")
         and item.get("context_epoch") == event.get("context_epoch")
     )]
-    if not all(any(_covers(confirmations[key], item, inventory) for item in fresh) for key in locator_ids):
+    if not all(reopened_sources_cover(confirmations[key], fresh, inventory, all_events=list(by_event.values()))
+               for key in locator_ids):
         return "post_finding_source_reopen_missing"
     if outcome not in REMEDIATING:
         return None

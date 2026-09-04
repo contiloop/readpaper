@@ -49,6 +49,7 @@ from .parse_invocation import Invocation
 from .sources import MediaKind, classify_media, discover_landing, fetch_public_url, local_source_token, normalize_url
 from .state import StateService
 from .storage import atomic_write_json, assert_regular_private_file, read_json
+from .visual_evidence import validated_visual_unit
 
 
 EVENT_FOR_RECORD = {
@@ -552,6 +553,7 @@ class CommandRuntime:
             actor=Actor.STATE_SERVICE,
             payload={
                 "unit_id": visual["unit_id"],
+                "path_sha256": digest_text(str(rendered.path.resolve())),
                 "image_sha256": rendered.image_sha256,
                 "pixel_sha256": rendered.pixel_sha256,
                 "pixel_width": rendered.pixel_width,
@@ -909,7 +911,7 @@ class CommandRuntime:
                 historical_frames.add(frame_id)
                 if event.get("context_stream_id") == main_context_stream_id and int(event.get("context_epoch", -1)) == main_context_epoch:
                     resident_frames.add(frame_id)
-            if event["event_kind"] == "visual_open_observed" and event["actor"] == "root_main" and event["result"] == "succeeded":
+            if validated_visual_unit(event, all_events, inventory) is not None:
                 visual_id = str(event["subject_id"])
                 historical_visuals.add(visual_id)
                 if event.get("context_stream_id") == main_context_stream_id and int(event.get("context_epoch", -1)) == main_context_epoch:

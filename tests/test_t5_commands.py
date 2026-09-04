@@ -232,14 +232,15 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
             payload={"complete": True, "content_sha256": frame["content_sha256"]},
             idempotency_key=f"ready-frame:{frame['frame_id']}",
         )
-    for visual in prepared["data"]["visual_units"]:
-        runtime.state.append_event(
-            **common,
-            event_kind=EventKind.VISUAL_OPEN_OBSERVED,
-            subject_id=visual["unit_id"],
-            payload={"complete": True},
-            idempotency_key=f"ready-visual:{visual['unit_id']}",
-        )
+    for index, visual in enumerate(prepared["data"]["visual_units"], start=100):
+        rendered = authorized(runtime, ["render", run_id, "--unit-id", visual["unit_id"],
+                              "--client-request-id", "cr_" + f"{index:032x}"], tool=index, turn_id="turn-ready")
+        assert rendered["ok"], rendered
+        DesktopObserver(tmp_path).post_tool({
+            "hook_event_name": "PostToolUse", "session_id": "session", "turn_id": "turn-ready", "cwd": str(tmp_path),
+            "tool_name": "view_image", "tool_use_id": f"ready-visual-{index}",
+            "tool_input": {"path": rendered["data"]["path"]}, "tool_response": {},
+        })
     runtime.state.put_versioned_record(
         paper_id=prepared["paper_id"],
         run_id=run_id,

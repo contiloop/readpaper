@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from readpaper.canonical import digest_text
 from readpaper.grounding import validate_answer_grounding
-from readpaper.locators import ImageRegionLocator, PdfObjectLocator, TextSpanLocator, validate_locator_confirmation
+from readpaper.locators import LOCATOR_ADAPTER, ImageRegionLocator, PdfObjectLocator, TextArtifactSpanLocator, TextSpanLocator, validate_locator_confirmation
 from readpaper.observer import DesktopObserver
 from readpaper.parse_invocation import parse_argv
 from test_t9_hooks import prepared_run, quote
@@ -99,8 +100,11 @@ def test_invalid_grounding_cannot_pass(mutation: str, blocker: str) -> None:
     assert any(item.startswith(blocker) for item in validation.blocker_ids)
 
 
-def test_grounding_accepts_contiguous_cross_frame_span_but_not_a_gap() -> None:
+@pytest.mark.parametrize("text_artifact", [False, True])
+def test_grounding_accepts_contiguous_cross_frame_span_but_not_a_gap(text_artifact: bool) -> None:
     data = evidence()
+    if text_artifact:
+        use_text_artifact(data)
     assert validate_answer_grounding(**data).valid
     frame = data["inventory"]["frames"][0]
     second = deepcopy(frame)
@@ -135,14 +139,39 @@ def test_visual_locators_require_matching_image_open(image: bool) -> None:
     data["grounding_record"]["payload"]["claim_bindings"][0]["confirmed_locator_ids"] = [locator.locator_id]
     assert not validate_answer_grounding(**data).valid  # A text frame cannot cover an image/object.
     data["events"][3].update({"event_kind": "visual_open_observed", "subject_id": "visual"})
+    assert not validate_answer_grounding(**data).valid  # Unit names alone are not visual evidence.
+    data["events"][3]["payload"].update({"render_id": "render", "render_event_id": "render-event",
+                                         "path_sha256": "e" * 64, "image_sha256": "f" * 64})
+    data["events"].append({"event_id": "render-event", "event_seq": 0, "event_kind": "render_created",
+                           "actor": "state_service", "result": "succeeded", "subject_id": "render",
+                           "payload": {"unit_id": "visual", "path_sha256": "e" * 64, "image_sha256": "f" * 64}})
     assert validate_answer_grounding(**data).valid
+    for field in ("render_id", "render_event_id", "path_sha256", "image_sha256"):
+        invalid = deepcopy(data)
+        invalid["events"][3]["payload"][field] = "a" * 64
+        assert not validate_answer_grounding(**invalid).valid
     data["events"][3]["subject_id"] = "unrelated-visual"
     assert not validate_answer_grounding(**data).valid
 
 
-@pytest.mark.parametrize("mutation", ["bounds", "hash", "artifact", "bundle", "scope"])
-def test_locator_confirmation_rejects_noncanonical_source(mutation: str) -> None:
+def use_text_artifact(data: dict) -> None:
+    """Keep the internal page-zero sentinel out of the public locator schema."""
+    locator_data = data["records"][0]["payload"]["locator"].copy()
+    locator_data.pop("pdf_page")
+    locator_data["locator_kind"] = "text_artifact_span"
+    locator = TextArtifactSpanLocator.model_validate(locator_data)
+    data["records"][0]["payload"] = {"locator_id": locator.locator_id, "locator": locator.model_dump()}
+    data["grounding_record"]["payload"]["claim_bindings"][0]["confirmed_locator_ids"] = [locator.locator_id]
+    data["inventory"]["pages"][0]["pdf_page"] = 0
+    data["inventory"]["frames"][0]["source_ranges"][0]["pdf_page"] = 0
+
+
+@pytest.mark.parametrize("text_artifact", [False, True])
+@pytest.mark.parametrize("mutation", ["bounds", "hash", "artifact", "bundle", "scope", "page", "ref", "empty", "reversed"])
+def test_locator_confirmation_rejects_noncanonical_source(mutation: str, text_artifact: bool) -> None:
     data = evidence()
+    if text_artifact:
+        use_text_artifact(data)
     payload = data["records"][0]["payload"]
     locator = payload["locator"]
     if mutation == "bounds":
@@ -153,15 +182,38 @@ def test_locator_confirmation_rejects_noncanonical_source(mutation: str) -> None
         locator["artifact_id"] = "other"
     elif mutation == "bundle":
         locator["bundle_id"] = "other"
+    elif mutation == "page":
+        data["inventory"]["pages"][0]["pdf_page"] = 2
+    elif mutation == "ref":
+        locator["artifact_ref_id"] = "other"
+    elif mutation in {"empty", "reversed"}:
+        locator["char_start"] = locator["char_end"] + (mutation == "reversed")
     else:
         data["inventory"]["required_artifact_ref_ids"] = []
-    payload["locator_id"] = TextSpanLocator.model_validate(locator).locator_id
     with pytest.raises(ValueError):
+        payload["locator_id"] = LOCATOR_ADAPTER.validate_python(locator).locator_id
         validate_locator_confirmation(payload, data["inventory"])
 
 
-def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tmp_path: Path, monkeypatch) -> None:
-    runtime, prepared, frame_id, visual_id = prepared_run(tmp_path)
+@pytest.mark.parametrize("extension", [None, "txt", "md", "markdown", "rst"])
+def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tmp_path: Path, monkeypatch, extension: str | None) -> None:
+    source_url = None
+    if extension:
+        source_url = "https://example.org/article"
+        def fetch(url: str):
+            fixtures = {
+                source_url: (f'<html><a href="/paper.pdf">PDF</a><a href="/supplement.{extension}">Supplementary</a></html>'.encode(), "text/html"),
+                "https://example.org/paper.pdf": ((tmp_path / "fixture.pdf").read_bytes(), "application/pdf"),
+                f"https://example.org/supplement.{extension}": ("보충 자료의 결과: 정확도는 90%이다.\n".encode(), "text/plain"),
+            }
+            content, media = fixtures[url]
+            return SimpleNamespace(final_url=url, data=content, content_type=media)
+        monkeypatch.setattr("readpaper.commands.fetch_public_url", fetch)
+    runtime, prepared, frame_id, visual_id = prepared_run(tmp_path, source_url=source_url)
+    inventory = json.loads(Path(prepared["data"]["inventory_path"]).read_text())
+    page = next(item for item in inventory["pages"] if item["pdf_page"] == (0 if extension else 1))
+    frame_id = next(item["frame_id"] for item in inventory["frames"]
+                    if any(source["artifact_ref_id"] == page["artifact_ref_id"] for source in item["source_ranges"]))
     observer = DesktopObserver(tmp_path)
     run_id, paper_id = prepared["run_id"], prepared["paper_id"]
     count = 100
@@ -183,7 +235,8 @@ def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tm
         return command(["record", run_id, "--kind", kind, "--payload", str(path)])
     def checked() -> dict:
         return json.loads(runtime.execute(parse_argv(["check", run_id, "--answer-id", answer_id])))["data"]
-    command(["read", run_id, "--frame-id", frame_id])
+    for frame in inventory["frames"]:
+        assert command(["read", run_id, "--frame-id", frame["frame_id"]])["ok"]
     before_begin = [json.loads(line) for line in runtime.state.layout.run_events(paper_id, run_id).read_text().splitlines()
                     if json.loads(line)["event_kind"] == "source_frame_emitted"][-1]["event_id"]
     rendered = command(["render", run_id, "--unit-id", visual_id])
@@ -196,20 +249,25 @@ def test_protected_command_grounding_rejects_bypass_and_finalizes_valid_chain(tm
     begun = command(["answer", run_id, "--begin", "--task-id", "task", "--user-turn-id", "turn-0"])
     answer_id, attempt_id = begun["data"]["answer_id"], begun["data"]["response_attempt_id"]
     final_payload = evidence()["finalization_record"]["payload"] | {"answer_id": answer_id, "response_attempt_id": attempt_id}
+    final_payload.update({"final_content": page["text"], "final_content_sha256": digest_text(page["text"]),
+                          "paper_claims": [{"claim_id": "claim", "char_start": 0, "char_end": len(page["text"]),
+                                            "claim_text_sha256": digest_text(page["text"])}]})
     assert not record("answer_grounding", {})["ok"]
     minimal = {key: final_payload[key] for key in ("answer_id", "response_attempt_id", "final_content_sha256")}
     assert not record("explanation_finalized", minimal)["ok"]
     assert record("answer_grounding", minimal)["ok"] is False
     finalized = record("explanation_finalized", final_payload)
     assert finalized["ok"]
-    inventory = json.loads(Path(prepared["data"]["inventory_path"]).read_text())
-    page = inventory["pages"][0]
-    locator = TextSpanLocator(bundle_id=prepared["bundle_id"], artifact_ref_id=page["artifact_ref_id"], artifact_id=page["artifact_id"],
-                              pdf_page=1, char_start=0, char_end=len(page["text"]), content_sha256=digest_text(page["text"]))
+    locator_type = TextArtifactSpanLocator if extension else TextSpanLocator
+    locator = locator_type(bundle_id=prepared["bundle_id"], artifact_ref_id=page["artifact_ref_id"], artifact_id=page["artifact_id"],
+                           char_start=0, char_end=len(page["text"]), content_sha256=digest_text(page["text"]),
+                           **({} if extension else {"pdf_page": 1}))
+    assert ("pdf_page" not in locator.model_dump()) == bool(extension)
     invalid = locator.model_copy(update={"content_sha256": "f" * 64})
     assert record("locator_confirmation", {"locator_id": invalid.locator_id, "locator": invalid.model_dump()})["error"]["code"] == "INVALID_LOCATOR"
     assert record("locator_confirmation", {"locator_id": locator.locator_id, "locator": locator.model_dump()})["ok"]
     grounding = evidence()["grounding_record"]["payload"] | minimal | {"finalization_record_id": finalized["data"]["record_id"]}
+    grounding["claim_bindings"][0]["claim_text_sha256"] = digest_text(page["text"])
     grounding["claim_bindings"][0].update({"confirmed_locator_ids": [locator.locator_id], "source_reopen_event_ids": [before_begin]})
     assert not record("answer_grounding", grounding)["ok"]
     # Old persisted minimal records must not bypass check even though new admission rejects them.

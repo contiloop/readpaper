@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from readpaper.findings import pending_content_findings
-from readpaper.locators import PdfPageLocator
+from readpaper.canonical import digest_text
+from readpaper.locators import PdfPageLocator, TextArtifactSpanLocator
 
 
 def evidence(outcome: str = "rejected") -> dict:
@@ -94,3 +95,35 @@ def test_new_empty_audit_does_not_erase_undisposed_findings() -> None:
     data["latest_results"] = [data["latest_results"][-1]]
     data["latest_results"][0]["payload"]["recheck_finding_ids"] = []
     assert pending_content_findings(**data) == {"finding": "disposition_missing"}
+
+
+def test_text_supplementary_finding_requires_canonical_reopen() -> None:
+    data = evidence()
+    page = data["inventory"]["pages"][0]
+    page["pdf_page"] = 0
+    locator = TextArtifactSpanLocator(bundle_id="bundle", artifact_ref_id="ref", artifact_id="artifact",
+                                      char_start=0, char_end=100, content_sha256=digest_text(page["text"]))
+    records = {item["record_id"]: item for item in data["records"]}
+    records["confirm"]["payload"] = {"locator_id": locator.locator_id, "locator": locator.model_dump()}
+    records["origin"]["payload"]["findings"][0]["locator_ids"] = [locator.locator_id]
+    records["disposition"]["payload"]["confirmed_locator_ids"] = [locator.locator_id]
+    span = data["inventory"]["frames"][0]["source_ranges"][0]
+    span["pdf_page"] = 0
+    assert pending_content_findings(**data) == {}
+    span["char_end"] = 99
+    assert pending_content_findings(**data) == {"finding": "post_finding_source_reopen_missing"}
+
+
+def test_visual_finding_requires_render_bound_reopen() -> None:
+    data = evidence()
+    reopened = next(item for item in data["events"] if item["event_id"] == "reopen")
+    reopened.update({"event_kind": "visual_open_observed", "subject_id": "visual"})
+    assert pending_content_findings(**data) == {"finding": "post_finding_source_reopen_missing"}
+    reopened["payload"] = {"render_id": "render", "render_event_id": "render-event",
+                           "path_sha256": "a" * 64, "image_sha256": "b" * 64}
+    data["events"].append({"event_id": "render-event", "event_seq": 0, "event_kind": "render_created", "subject_id": "render",
+                           "actor": "state_service", "result": "succeeded",
+                           "payload": {"unit_id": "visual", "path_sha256": "a" * 64, "image_sha256": "b" * 64}})
+    assert pending_content_findings(**data) == {}
+    reopened["payload"]["image_sha256"] = "c" * 64
+    assert pending_content_findings(**data) == {"finding": "post_finding_source_reopen_missing"}

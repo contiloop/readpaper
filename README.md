@@ -140,6 +140,8 @@ Content-audit findings remain blockers until Main supplies a valid disposition, 
 
 Every answer also requires a structurally validated [grounding chain](.agents/skills/readpaper/references/grounding.md): exact final text and declared claim spans, canonical source locators, current-attempt/current-epoch root Main reopen events covering those locators, and the exact finalization record ID. Both record admission and `check` enforce it, including for follow-up Q&A. Old hash-only grounding records do not pass. This verifies evidence identity and coverage for declared claims, not semantic entailment or automatic completeness of claim selection; those judgments still belong to Main and reviewers.
 
+Supported text supplementary files (`.txt`, `.md`, `.markdown`, `.rst`) use `text_artifact_span` locators with canonical character ranges and hashes, without a PDF page field. Visual evidence must bind the resolved opened path and file hash to a preceding protected render, including its render ID and event ID. Reading checks, grounding and finding dispositions reject unbound legacy observations and mismatched files; affected visual units need a fresh render/open.
+
 Stop visual repairs are explicitly `render → view_image(data.path) → check`. Rendering alone leaves the repair awaiting visual observation. The one-shot repair budget is reserved at request time to prevent duplicates; actual completion requires a matching image-open event. Each new run gets a fresh run-level repair budget.
 
 For this workspace’s Korean report style, `AGENTS.md` currently fixes these defaults:
