@@ -512,9 +512,16 @@ class DesktopObserver:
                 agent_id=None, agent_execution_id=capability["agent_execution_id"], context_stream_id=capability["context_stream_id"],
                 context_epoch=int(capability["context_epoch"]), tool_use_id=tool_use,
             )
+        from .stop import StopCoordinator
+        StopCoordinator(self.root).observe_repair_tool(task_id=task_id, tool_use_id=tool_use, envelope=envelope)
         return b""
 
     def _observe_visual_open(self, payload: dict[str, Any]) -> bytes:
+        response = payload.get("tool_response")
+        if payload.get("error") or (isinstance(response, dict) and (
+            response.get("isError") or response.get("is_error") or response.get("error")
+        )):
+            return b""
         tool_input = payload.get("tool_input")
         raw_path = tool_input.get("path") if isinstance(tool_input, dict) else None
         if not isinstance(raw_path, str):
@@ -542,7 +549,7 @@ class DesktopObserver:
             subject_id=str(path), payload={"path_sha256": digest_text(str(path)), "image_sha256": image_sha, "actual_open": path.is_file()},
         )
         if path.is_file():
-            self.state.append_event(
+            opened = self.state.append_event(
                 paper_id=paper_id, run_id=run_id, event_kind=EventKind.VISUAL_OPEN_OBSERVED,
                 subject_id=path.stem.rsplit("-", 1)[0], result=EventResult.SUCCEEDED, actor=Actor.ROOT_MAIN,
                 payload={"path_sha256": digest_text(str(path)), "image_sha256": image_sha},
@@ -550,6 +557,8 @@ class DesktopObserver:
                 session_id=session, turn_id=turn, agent_execution_id=execution, context_stream_id=stream,
                 context_epoch=self._context_epoch(task_id, stream), tool_use_id=payload["tool_use_id"],
             )
+            from .stop import StopCoordinator
+            StopCoordinator(self.root).observe_visual_repair(task_id=task_id, image_path=str(path), image_sha256=str(image_sha), event=opened)
         return b""
 
     def session_start(self, payload: dict[str, Any]) -> bytes:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -45,7 +46,11 @@ def identities(data: bytes) -> tuple[str, str, str, str]:
 def test_ten_page_extraction_preserves_every_page_and_marker(tmp_path: Path) -> None:
     data = make_pdf(tmp_path / "ten.pdf")
     _, artifact, ref, bundle = identities(data)
-    result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
+    import subprocess
+    with patch("readpaper.documents.subprocess.run", wraps=subprocess.run) as process:
+        result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
+    assert process.call_count == 1
+    assert Path(process.call_args.args[0][0]).name == "pdftotext"
     assert len(result.pages) == 10
     assert result.sections
     assert result.frames
@@ -77,6 +82,22 @@ def test_empty_page_is_not_silently_treated_as_text_coverage(tmp_path: Path) -> 
     assert result.pages[0].warnings == ("empty_text",)
     assert result.sections == ()
     assert result.frames == ()
+
+
+def test_blank_middle_page_keeps_original_page_numbers(tmp_path: Path) -> None:
+    path = tmp_path / "blank-middle.pdf"
+    document = canvas.Canvas(str(path))
+    for text in ("first page", "", "third page"):
+        if text:
+            document.drawString(72, 720, text)
+        document.showPage()
+    document.save()
+    data = path.read_bytes()
+    _, artifact, ref, bundle = identities(data)
+    result = extract_pdf(data, bundle_id=bundle, artifact_ref_id=ref, artifact_id=artifact)
+    assert [page.pdf_page for page in result.pages] == [1, 2, 3]
+    assert result.pages[1].warnings == ("empty_text",)
+    assert "third page" in result.pages[2].text
 
 
 def test_numbered_headings_create_nonoverlapping_logical_sections(tmp_path: Path) -> None:
@@ -132,10 +153,13 @@ def test_figure_caption_is_not_a_section_heading() -> None:
         "A simple baseline is used for comparison",
         "I propose a simple alternative",
         "V denotes the vocabulary size",
+        "1 We evaluate the baseline on two datasets",
+        "2024 was a significant year for this method",
     ],
 )
 def test_unpunctuated_letter_or_roman_prose_is_not_a_heading(line: str) -> None:
     assert not is_heading_candidate(line, previous_blank=False, next_blank=False)
+    assert not is_heading_candidate(line, previous_blank=True, next_blank=True)
 
 
 def test_decimal_and_punctuated_appendix_headings_are_recognized() -> None:

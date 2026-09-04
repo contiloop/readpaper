@@ -174,6 +174,7 @@ class StateService:
                     "current_run_id": run_id,
                     "current_paper_id": paper_id,
                     "current_bundle_id": bundle_id,
+                    "run_auto_resume_count": 0,
                 }
             )
             self._write_binding(binding)
@@ -255,6 +256,8 @@ class StateService:
         authority_host_event_id: str,
         committed_by_agent_execution_id: str,
         client_request_id: str,
+        context_stream_id: str | None = None,
+        context_epoch: int | None = None,
     ) -> RunEvent:
         """Commit paper-reading completion independently from any answer."""
 
@@ -270,12 +273,19 @@ class StateService:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "reading run is not current for task")
             if run.event_seq != expected_event_seq:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "run changed after the reading check")
-            if run.state is not RunState.REVIEWING:
+            if run.state not in {RunState.REVIEWING, RunState.READ_COMPLETE, RunState.COMPLETE}:
                 raise ReadPaperError(
                     ErrorCode.STATE_CONFLICT,
                     "reading can finalize only after review",
                 )
-            changed = run.model_copy(update={"state": RunState.READ_COMPLETE})
+            stream, epoch = self._main_context(binding)
+            if (context_stream_id is not None and context_stream_id != stream) or (context_epoch is not None and context_epoch != epoch):
+                raise ReadPaperError(ErrorCode.STATE_CONFLICT, "Main context changed after the reading check")
+            changed = run.model_copy(update={
+                "state": RunState.READ_COMPLETE,
+                "reading_finalized_context_stream_id": stream,
+                "reading_finalized_context_epoch": epoch,
+            })
             event, after = self._plan_event(
                 changed,
                 event_kind=EventKind.READING_FINALIZED,
@@ -286,6 +296,8 @@ class StateService:
                     "run_from": run.state.value,
                     "run_to": changed.state.value,
                     "completion_mode": run.completion_mode.value,
+                    "reading_finalized_context_stream_id": stream,
+                    "reading_finalized_context_epoch": epoch,
                     "authority_host_event_id": authority_host_event_id,
                     "committed_by_agent_execution_id": committed_by_agent_execution_id,
                 },
@@ -293,10 +305,30 @@ class StateService:
                 source_host_event_id=authority_host_event_id,
                 client_request_id=client_request_id,
                 agent_execution_id=committed_by_agent_execution_id,
+                context_stream_id=stream,
+                context_epoch=epoch,
             )
             self._commit_run(after, event)
             self._write_binding(binding.model_copy(update={"active_run_id": None}))
             return event
+
+    def _main_context(self, binding: TaskBinding) -> tuple[str, int]:
+        """Read under the task lock shared with compact observers."""
+        stream = sequence_id("ctx", binding.task_id, binding.session_id, "root")
+        host_path = self.layout.host_state(binding.task_id)
+        host = read_json(host_path) if host_path.exists() else {}
+        compact = host.get("compact_streams", {}).get(stream, {})
+        if compact.get("open") is not None:
+            raise ReadPaperError(ErrorCode.STATE_CONFLICT, "Main context compaction is in progress")
+        return stream, int(compact.get("context_epoch", 0))
+
+    def _require_initial_answer_context(self, run: RunSnapshot, binding: TaskBinding, answer_id: str | None = None) -> None:
+        if run.requires_initial_answer_context(answer_id):
+            if (run.reading_finalized_context_stream_id, run.reading_finalized_context_epoch) != self._main_context(binding):
+                raise ReadPaperError(
+                    ErrorCode.STATE_CONFLICT,
+                    "initial answer requires full-source reopening and run --finalize-reading in the current Main context epoch",
+                )
 
     def lock_scope(
         self,
@@ -379,6 +411,7 @@ class StateService:
                     ErrorCode.STATE_CONFLICT,
                     "an answer can begin only after reading is complete",
                 )
+            self._require_initial_answer_context(run, binding)
             if binding.pending_answer_id is not None:
                 raise ReadPaperError(ErrorCode.ANSWER_PENDING, "task already has a pending answer")
             if binding.delivery_candidate_answer_id is not None:
@@ -494,6 +527,7 @@ class StateService:
                     ErrorCode.STATE_CONFLICT,
                     "content can finalize only after reading is complete",
                 )
+            self._require_initial_answer_context(run, binding, answer_id)
             response_id = answer["current_response_attempt_id"]
             if response_id != binding.current_response_attempt_id:
                 raise ReadPaperError(ErrorCode.STATE_CONFLICT, "response attempt binding changed")

@@ -21,7 +21,7 @@ Choose the smallest applicable route:
 
 - For a new source: `prepare`, show the artifact scope, lock scope with `record --kind scope_confirmation`, ingest and audit the paper, pass the run-only `check`, and call `run --finalize-reading` before beginning an answer.
 - Use ordinary `prepare` when the current request needs a user-facing report or answer. Use `prepare --ingest-only` only when the user explicitly asks to read now and answer later; it permits clean completion without opening an answer lifecycle.
-- For a question about the current completed paper: the first ReadPaper action is `answer --begin`.
+- For a question about the current completed paper: the first ReadPaper action is `answer --begin`. If this is still the initial answer-required report and the saved reading epoch no longer matches, first restore full-source coverage and refresh `run --finalize-reading` as described below.
 - If an answer's content is still drafting or interrupted, do not start another question. Ask for explicit resume or abandon and use the matching lifecycle command. A delivery observation that is pending or unknown does not block a new question.
 - After a Desktop session boundary, do not claim prior live context. Resume the run explicitly; if an answer is pending, resume it in the same root execution.
 
@@ -33,11 +33,15 @@ Count a section as historically covered only after all of its frames have been o
 
 Record printed labels only after opening the page. Keep printed labels distinct from PDF page numbers. Confirm locators before using them as evidence.
 
+Use the startup context preset reported by `prepare`: `long-paper` is the default full-context allocation; `cost-controlled` intentionally limits context for cost control. The policy subtracts output/workflow reserves and per-visual estimates before accepting scope. These estimates do not measure current host usage. Never change context settings or hook wiring during a run. If `inventory_inline=false`, inspect the complete `inventory_path` in bounded metadata slices; do not dump its canonical source text as a substitute for observed `read` calls.
+
 ## Explain and audit
 
 Write one immutable understanding note only after full synthesis coverage. The note is an aid, not a replacement for source reopening.
 
 Use the independent reviewer contracts in [references/audits.md](references/audits.md). Reviewers do not replace Main reading. Reopen every finding's source location yourself before accepting, rejecting, or leaving it unresolved.
+
+`pending_finding_ids` and `pending_finding_reasons` are enforced blockers. Record the confirmed locator definitions, post-finding reopen event IDs, rationale and disposition. Accepted/partially accepted/modified findings require a changed descendant note or draft plus a bound reviewer recheck of that exact remediation. Merely returning an audit or writing a disposition label does not resolve a finding.
 
 For every answer, create a new immutable draft for the current response attempt, distinguish paper claims from Main inference and unsupported conclusions, and attach confirmed locators. Apply the fixed scope disclosure as the exact last block when scope is reduced.
 
@@ -46,5 +50,9 @@ All paper answers require current-attempt source reopening and `answer_grounding
 Begin an answer before writing answer-specific drafts, running an answer flow audit, recording answer grounding, or finalizing content. An answer attempt is not required for preparation, scope locking, source ingestion, visual inspection, understanding notes, content audits, or a run-only `check`.
 
 First run `check` without an answer ID, resolve every blocker until it returns `reading_ready`, and call `run --finalize-reading`. This commits the independent `read_complete` state, releases the active-run slot, and retains the run as current. For an answer-required run, begin an answer before sending any user-facing paper report. Run `check --answer-id`, resolve every blocker, and when it returns `ready_to_finalize_content`, call `answer --finalize` before sending the exact finalized content. Answer finalization never changes reading completion. Stop observation may later upgrade delivery to `sent_verified`; if Desktop cannot observe it, record `delivery_unknown` without reopening content or blocking the next question.
+
+The first answer-required report uses a strict context policy: its beginning and content finalization require the saved `reading_finalized_context_stream_id` and `reading_finalized_context_epoch` to match Main's current context. Compaction in progress blocks completion. After a mismatch, reopen every required frame and visual in one epoch, pass a run-only `check`, refresh `run --finalize-reading`, and record current-epoch answer grounding before finalizing. Ingest-only runs and subsequent answers may inherit historical full-paper coverage; they still need question-specific reopening and grounding.
+
+When Stop requests a visual repair, execute its exact render command, open the returned `data.path` with `view_image`, then rerun `check`. A created PNG is not repair completion. The one-shot allowance is reserved when requested; the repair stays pending until the matching visual-open observation.
 
 Never claim `full_paper_in_live_context`, `understanding_verified`, or semantic certainty from mechanical checks.

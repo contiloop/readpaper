@@ -20,6 +20,8 @@ MANIFEST_FILES = (
     ".codex/hooks/readpaper_stop_hook.py",
     ".codex/hooks/readpaper_compact_hook.py",
     ".codex/config.toml",
+    ".codex/readpaper-context.toml",
+    ".agents/skills/readpaper/scripts/readpaper/context_budget.py",
     ".agents/skills/readpaper/scripts/readpaper/parse_invocation.py",
     ".agents/skills/readpaper/scripts/paper.py",
     ".agents/skills/readpaper/SKILL.md",

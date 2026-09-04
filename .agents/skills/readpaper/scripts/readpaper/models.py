@@ -264,6 +264,8 @@ class RunSnapshot(StrictModel):
     task_id: str
     state: RunState = RunState.PREPARED
     completion_mode: RunCompletionMode = RunCompletionMode.ANSWER_REQUIRED
+    reading_finalized_context_stream_id: str | None = None
+    reading_finalized_context_epoch: int | None = None
     resume_phase: RunState | None = None
     scope_kind: ScopeKind = ScopeKind.FULL
     interpretation_state: InterpretationState = InterpretationState.NONE
@@ -277,6 +279,13 @@ class RunSnapshot(StrictModel):
     record_heads: dict[str, dict[str, str]] = Field(default_factory=dict)
     context_epochs: dict[str, int] = Field(default_factory=dict)
     answers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    def requires_initial_answer_context(self, answer_id: str | None = None) -> bool:
+        terminal = {AnswerStatus.CONTENT_FINALIZED.value, AnswerStatus.SENT_VERIFIED.value, AnswerStatus.DELIVERY_UNKNOWN.value}
+        return self.completion_mode is RunCompletionMode.ANSWER_REQUIRED and not any(
+            key != answer_id and answer.get("answer_status") in terminal
+            for key, answer in self.answers.items()
+        )
 
 
 class RunEvent(StrictModel):

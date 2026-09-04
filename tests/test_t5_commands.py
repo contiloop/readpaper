@@ -8,10 +8,11 @@ from reportlab.pdfgen import canvas
 
 from readpaper.authority import bound_request_document
 from readpaper.canonical import digest, digest_text
-from readpaper.commands import CommandRuntime, TOOL_OUTPUT_TOKEN_LIMIT
+from readpaper.commands import CommandRuntime
 from readpaper.documents import estimate_tokens
 from readpaper.errors import ErrorCode, ReadPaperError
 from readpaper.models import Actor, EventKind, EventResult, HostEventKind, RunState
+from readpaper.observer import DesktopObserver
 from readpaper.ids import sequence_id
 from readpaper.parse_invocation import Invocation, parse_argv
 
@@ -78,6 +79,8 @@ def test_prepare_scope_read_without_answer_render_and_check_contract(
     frame_id = prepared["data"]["transport_frames"][0]["frame_id"]
     visual_id = prepared["data"]["visual_units"][0]["unit_id"]
     assert prepared["data"]["sections"][0]["frame_ids"] == [frame_id]
+    assert "source_ranges" not in prepared["data"]["sections"][0]
+    assert "content_sha256" not in prepared["data"]["transport_frames"][0]
     assert prepared["data"]["residency_plan"]["estimated_to_fit"] is True
 
     replayed = authorized(
@@ -124,11 +127,11 @@ def test_prepare_scope_read_without_answer_render_and_check_contract(
     assert read["data"]["frame"]["frame_id"] == frame_id
     assert "source_ranges" not in read["data"]["frame"]
     assert read["data"]["tool_use_id"] == "tool-4"
-    assert estimate_tokens(json.dumps(read, ensure_ascii=False)) <= TOOL_OUTPUT_TOKEN_LIMIT
+    assert estimate_tokens(json.dumps(read, ensure_ascii=False)) <= runtime.context_policy.tool_output_token_limit
 
     monkeypatch.setattr(
         "readpaper.commands.estimate_tokens",
-        lambda _: TOOL_OUTPUT_TOKEN_LIMIT + 1,
+        lambda _: runtime.context_policy.tool_output_token_limit + 1,
     )
     oversized = authorized(
         runtime,
@@ -168,7 +171,8 @@ def test_prepare_scope_read_without_answer_render_and_check_contract(
     assert checked["data"]["main_context_epoch"] == 0
 
 
-def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("ingest_only", [True, False])
+def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, monkeypatch, ingest_only: bool) -> None:
     runtime = CommandRuntime(tmp_path)
     runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
     runtime.state.append_host_event(
@@ -184,7 +188,7 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         runtime,
         [
             "prepare", str(source), "--task-id", "task", "--user-turn-id", "turn-ready",
-            "--client-request-id", "cr_" + "6" * 32, "--ingest-only",
+            "--client-request-id", "cr_" + "6" * 32, *(["--ingest-only"] if ingest_only else []),
         ],
         tool=10,
     )
@@ -219,7 +223,8 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         "context_stream_id": stream,
         "context_epoch": 0,
     }
-    for frame in prepared["data"]["transport_frames"]:
+    inventory = json.loads(Path(prepared["data"]["inventory_path"]).read_text())
+    for frame in inventory["frames"]:
         runtime.state.append_event(
             **common,
             event_kind=EventKind.SOURCE_FRAME_EMITTED,
@@ -267,11 +272,44 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         turn_id="turn-ready",
     )
     assert finalized["data"]["run_state"] == "read_complete"
-    assert finalized["data"]["completion_mode"] == "ingest_only"
+    assert finalized["data"]["completion_mode"] == ("ingest_only" if ingest_only else "answer_required")
     assert finalized["data"]["active_run_released"] is True
     binding = runtime.state.get_binding("task")
     assert binding.active_run_id is None
     assert binding.current_run_id == run_id
+
+    stored = runtime.state.get_run(prepared["paper_id"], run_id)
+    assert (stored.reading_finalized_context_stream_id, stored.reading_finalized_context_epoch) == (stream, 0)
+    observer = DesktopObserver(tmp_path)
+    compact = {"session_id": "session", "cwd": str(tmp_path), "trigger": "auto", "task_id": "task"}
+    observer.compact({"hook_event_name": "PreCompact", **compact})
+    during = json.loads(runtime.execute(parse_argv(["check", run_id])))["data"]
+    assert "main_context_compaction_in_progress" in during["blocking_ids"]
+    observer.compact({"hook_event_name": "PostCompact", **compact})
+    after = json.loads(runtime.execute(parse_argv(["check", run_id])))["data"]
+    assert after["reading_context_refresh_required"] is (not ingest_only)
+    assert after["missing_resident_frame_ids"]
+    assert after["decision"] == ("reading_complete" if ingest_only else "block")
+    if not ingest_only:
+        denied = authorized(runtime, [
+            "answer", run_id, "--begin", "--task-id", "task", "--user-turn-id", "turn-ready",
+            "--client-request-id", "cr_" + "b" * 32,
+        ], tool=14, turn_id="turn-ready")
+        assert denied["error"]["code"] == ErrorCode.STATE_CONFLICT.value
+        for event in [json.loads(line) for line in runtime.state.layout.run_events(prepared["paper_id"], run_id).read_text().splitlines()]:
+            if event["event_kind"] in {"source_frame_emitted", "visual_open_observed"}:
+                runtime.state.append_event(
+                    **(common | {"context_epoch": 1}), event_kind=EventKind(event["event_kind"]),
+                    subject_id=event["subject_id"], payload=event["payload"],
+                    idempotency_key=f"reload:{event['event_id']}",
+                )
+        assert json.loads(runtime.execute(parse_argv(["check", run_id])))["data"]["decision"] == "reading_ready"
+        refreshed = authorized(runtime, [
+            "run", run_id, "--finalize-reading", "--task-id", "task", "--user-turn-id", "turn-ready",
+            "--client-request-id", "cr_" + "c" * 32,
+        ], tool=15, turn_id="turn-ready")
+        assert refreshed["ok"] is True
+        assert runtime.state.get_run(prepared["paper_id"], run_id).reading_finalized_context_epoch == 1
 
     runtime.state.append_host_event(
         task_id="task",
@@ -290,6 +328,48 @@ def test_run_only_check_can_report_reading_ready_without_answer(tmp_path: Path, 
         turn_id="turn-follow-up",
     )
     assert begun["data"]["answer_status"] == "drafting"
+    if not ingest_only:
+        answer_id = begun["data"]["answer_id"]
+        stored = runtime.state.get_run(prepared["paper_id"], run_id)
+        observer.compact({"hook_event_name": "PreCompact", **compact})
+        # Compaction changes the host ledger, not run.event_seq: CAS alone is insufficient.
+        with pytest.raises(ReadPaperError, match="compaction is in progress"):
+            runtime.state.finalize_answer_content(
+                task_id="task", paper_id=prepared["paper_id"], run_id=run_id, answer_id=answer_id,
+                final_content_sha256="a" * 64, expected_event_seq=stored.event_seq,
+                authority_host_event_id="hev_" + "8" * 64,
+                committed_by_agent_execution_id="ae_" + "8" * 64, client_request_id="cr_" + "d" * 32,
+            )
+        observer.compact({"hook_event_name": "PostCompact", **compact})
+        after = json.loads(runtime.execute(parse_argv(["check", run_id, "--answer-id", answer_id])))["data"]
+        assert "reading_context_refresh_required" in after["blocking_ids"]
+
+
+def test_prepare_bounds_inline_inventory_without_losing_manifest(tmp_path: Path, monkeypatch) -> None:
+    runtime = CommandRuntime(tmp_path)
+    runtime.state.bind_session(task_id="task", session_id="session", hard_boundary=True)
+    runtime.state.append_host_event(
+        task_id="task", event_kind=HostEventKind.USER_TURN_STARTED, semantic_key="prepare-turn",
+        subject_id="turn-1", payload={"prompt_sha256": digest_text("read paper"), "byte_length": 10},
+    )
+    source = tmp_path / "bounded.pdf"
+    pdf(source)
+    def oversized_inventory(text: str) -> int:
+        value = json.loads(text)
+        return runtime.context_policy.tool_output_token_limit + 1 if value["data"]["inventory_inline"] else estimate_tokens(text)
+    monkeypatch.setattr("readpaper.commands.estimate_tokens", oversized_inventory)
+    prepared = authorized(runtime, [
+        "prepare", str(source), "--task-id", "task", "--user-turn-id", "turn-1",
+        "--client-request-id", "cr_" + "e" * 32,
+    ], tool=16)
+    assert prepared["ok"] is True
+    assert prepared["data"]["inventory_inline"] is False
+    assert "transport_frames" not in prepared["data"]
+    inventory = json.loads(Path(prepared["data"]["inventory_path"]).read_text())
+    assert inventory["frames"][0]["source_ranges"]
+    manifest = json.loads(Path(prepared["data"]["bundle_manifest_path"]).read_text())
+    assert manifest["artifacts"][0]["support_state"] == "supported"
+    assert estimate_tokens(json.dumps(prepared)) < runtime.context_policy.tool_output_token_limit
 
 
 def test_schema_v1_inventory_requires_explicit_local_state_migration(tmp_path: Path) -> None:

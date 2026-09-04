@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from readpaper.errors import ErrorCode, ReadPaperError
+from readpaper.context_budget import ContextBudgetPolicy
 from readpaper.observer import DesktopObserver
 from readpaper.state import StateService
 from readpaper.storage import read_json
@@ -22,13 +23,7 @@ def test_long_context_configuration() -> None:
     root = Path(__file__).resolve().parents[1]
     with (root / ".codex/config.toml").open("rb") as handle:
         config = tomllib.load(handle)
-    assert config == {
-        "model": "gpt-5.6-sol",
-        "model_context_window": 272000,
-        "model_auto_compact_token_limit": 230000,
-        "model_auto_compact_token_limit_scope": "total",
-        "tool_output_token_limit": 65536,
-    }
+    assert config == ContextBudgetPolicy.presets(root)["long-paper"].codex_settings()
     assert config["model_context_window"] > config["model_auto_compact_token_limit"]
     assert 48_000 < config["tool_output_token_limit"]
 

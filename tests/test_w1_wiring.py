@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path
 
 from readpaper.parse_invocation import SCHEMA_SHA256
+from readpaper.context_budget import ContextBudgetPolicy
 from readpaper.wiring import build_hooks_config, build_wiring_manifest
 
 
@@ -25,8 +26,7 @@ def test_wiring_manifest_and_hook_cardinality() -> None:
     with (ROOT / ".codex/config.toml").open("rb") as handle:
         config = tomllib.load(handle)
     assert config["model"] == "gpt-5.6-sol"
-    assert config["model_context_window"] == 272000
-    assert config["model_auto_compact_token_limit"] == 230000
+    assert config == ContextBudgetPolicy.load(ROOT).codex_settings()
     assert config["tool_output_token_limit"] == 65536
 
 

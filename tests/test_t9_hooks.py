@@ -10,6 +10,7 @@ from readpaper.canonical import digest, digest_text
 from readpaper.authority import bound_request_document
 from readpaper.audits import AuditStage, ContentRole, reserve_content_audit
 from readpaper.commands import CommandRuntime
+from readpaper.ids import sequence_id
 from readpaper.models import Actor, HostEventKind, RunCompletionMode, RunState, ScopeKind
 from readpaper.observer import DesktopObserver
 from readpaper.parse_invocation import parse_argv
@@ -246,6 +247,9 @@ def test_reviewer_start_and_protected_challenge_bind_reserved_execution(tmp_path
         "recheck_finding_ids": [],
         "recheck_results": [],
     }
+    finding_body = {"category": "definition_equation_error", "locator_ids": ["loc_equation_4"], "summary": "Incorrect lambda interpretation"}
+    finding_id = sequence_id("cf", reservation["audit_stage_id"], 1, 1, finding_body)
+    result["findings"] = [finding_body | {"finding_ordinal": 1, "finding_id": finding_id}]
     result_path = payload_dir / "audit-result.json"
     result_path.write_text(json.dumps(result), encoding="utf-8")
     words = [
@@ -279,6 +283,8 @@ def test_reviewer_start_and_protected_challenge_bind_reserved_execution(tmp_path
     assert claim["evidence_kind"] == "agent_start_plus_protected_challenge_v1"
     check = json.loads(runtime.execute(parse_argv(["check", run_id])))
     assert check["data"]["invalid_agent_execution_ids"] == []
+    assert check["data"]["pending_finding_ids"] == [finding_id]
+    assert f"audit_finding_unresolved:{finding_id}" in check["data"]["blocking_ids"]
 
     followup_execution = "ae_" + "d" * 64
     followup = reserve_content_audit(
@@ -598,6 +604,78 @@ def test_stop_repairs_missing_frame_without_an_answer(tmp_path: Path) -> None:
     command = blocked["reason"].splitlines()[-1]
     assert "'read'" in command
     assert frame_id in command
+
+
+def test_stop_visual_repair_completes_only_after_image_is_opened(tmp_path: Path) -> None:
+    runtime, prepared, frame_id, visual_id = prepared_run(tmp_path)
+    observer = DesktopObserver(tmp_path)
+    prefix = [str(tmp_path / ".venv/bin/python"), str(tmp_path / ".agents/skills/readpaper/scripts/paper.py")]
+    def observed_command(words: list[str], tool: str) -> dict:
+        base = {"session_id": "session", "turn_id": "turn-2", "cwd": str(tmp_path),
+                "tool_name": "Bash", "tool_use_id": tool, "tool_input": {"command": quote(words)}}
+        assert json.loads(observer.pre_tool({"hook_event_name": "PreToolUse", **base}))["hookSpecificOutput"]["permissionDecision"] == "allow"
+        response = runtime.execute(parse_argv(words[2:])).decode()
+        observer.post_tool({"hook_event_name": "PostToolUse", **base, "tool_response": {"output": response}})
+        return json.loads(response)
+    observed_command(prefix + ["read", prepared["run_id"], "--frame-id", frame_id, "--client-request-id", "cr_" + "8" * 32], "read-for-visual")
+    stop = StopCoordinator(tmp_path)
+    blocked = json.loads(stop.handle_stop({
+        "hook_event_name": "Stop", "session_id": "session", "turn_id": "turn-2", "cwd": str(tmp_path),
+        "stop_hook_active": False, "last_assistant_message": "incomplete visual",
+    }))
+    assert "data.path" in blocked["reason"] and "view_image" in blocked["reason"]
+    rendered = observed_command(shlex.split(blocked["reason"].splitlines()[-1]), "render-repair")
+    assert rendered["ok"] is True
+    transaction = stop._transactions("task")[0][1]
+    assert transaction["attempt_status"] == "awaiting_visual_open"
+    checked = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))["data"]
+    assert visual_id in checked["missing_resident_visual_unit_ids"]
+    open_payload = {
+        "hook_event_name": "PostToolUse", "session_id": "session", "turn_id": "turn-2", "cwd": str(tmp_path),
+        "tool_name": "view_image", "tool_use_id": "open-repair", "tool_input": {"path": rendered["data"]["path"]},
+        "tool_response": {},
+    }
+    observer.post_tool(open_payload | {"tool_response": {"isError": True}})
+    assert stop._transactions("task")[0][1]["attempt_status"] == "awaiting_visual_open"
+    observer.post_tool(open_payload)
+    transaction = stop._transactions("task")[0][1]
+    assert transaction["attempt_status"] == "completed"
+    assert transaction["visual_open_event_id"].startswith("ev_")
+    checked = json.loads(runtime.execute(parse_argv(["check", prepared["run_id"]])))["data"]
+    assert visual_id not in checked["missing_resident_visual_unit_ids"]
+
+
+def test_second_run_in_same_task_gets_its_own_stop_repair(tmp_path: Path) -> None:
+    runtime, prepared, _, _ = prepared_run(tmp_path)
+    stop = StopCoordinator(tmp_path)
+    payload = {"hook_event_name": "Stop", "session_id": "session", "turn_id": "turn-2", "cwd": str(tmp_path),
+               "stop_hook_active": False, "last_assistant_message": "incomplete"}
+    assert "'read'" in json.loads(stop.handle_stop(payload))["reason"]
+    assert runtime.state.get_binding("task").run_auto_resume_count == 1
+    DesktopObserver(tmp_path).user_prompt({
+        "hook_event_name": "UserPromptSubmit", "session_id": "session", "turn_id": "turn-3", "cwd": str(tmp_path),
+        "prompt": "read another paper", "task_id": "task",
+    })
+    runtime.state.transition(task_id="task", paper_id=prepared["paper_id"], run_id=prepared["run_id"],
+                             to_state=RunState.REVIEWING, actor=Actor.ROOT_MAIN, reason_code="note_recorded")
+    current = runtime.state.get_run(prepared["paper_id"], prepared["run_id"])
+    runtime.state.finalize_reading(
+        task_id="task", paper_id=current.paper_id, run_id=current.run_id, expected_event_seq=current.event_seq,
+        authority_host_event_id="hev_" + "a" * 64, committed_by_agent_execution_id="ae_" + "a" * 64,
+        client_request_id="cr_" + "a" * 32,
+    )
+    second = execute_authorized(runtime, ["prepare", str(tmp_path / "fixture.pdf"), "--task-id", "task",
+        "--user-turn-id", "turn-3", "--client-request-id", "cr_" + "b" * 32], "second-prepare")
+    assert second["ok"] is True
+    assert second["run_id"] != prepared["run_id"]
+    assert runtime.state.get_binding("task").run_auto_resume_count == 0
+    scope = tmp_path / "payloads/second-scope.json"
+    scope.write_text(json.dumps({"scope_kind": "full", "required_artifact_ref_ids": [second["data"]["artifacts"][0]["artifact_ref_id"]],
+                                 "excluded_artifacts": [], "user_turn_id": "turn-3"}))
+    assert execute_authorized(runtime, ["record", second["run_id"], "--kind", "scope_confirmation", "--payload", str(scope),
+        "--client-request-id", "cr_" + "c" * 32], "second-scope")["ok"]
+    assert "'read'" in json.loads(stop.handle_stop(payload | {"turn_id": "turn-3"}))["reason"]
+    assert runtime.state.get_binding("task").run_auto_resume_count == 1
 
 
 def test_stop_blocks_answer_required_read_complete_without_answer(

@@ -6,6 +6,7 @@ import pytest
 
 from readpaper.errors import ErrorCode, ReadPaperError
 from readpaper.ids import bundle_id, paper_id
+from readpaper.ids import sequence_id
 from readpaper.models import Actor, AnswerStatus, ResponseAttemptStatus, RunState, ScopeKind
 from readpaper.state import StateService
 
@@ -169,6 +170,12 @@ def test_content_completion_is_independent_from_delivery_and_does_not_block_next
     stored = service.get_run(PAPER, run_id).answers[answer_id]
     assert stored["answer_status"] == AnswerStatus.CONTENT_FINALIZED.value
     assert stored["attempts"][response_id]["status"] == ResponseAttemptStatus.CONTENT_FINALIZED.value
+
+    # Later answers inherit reading completion even when Main has compacted.
+    stream = sequence_id("ctx", "task", None, "root")
+    service.update_host_state(task_id="task", transform=lambda state: state.model_copy(update={
+        "compact_streams": {stream: {"context_epoch": 1, "open": None, "completed": []}},
+    }))
 
     next_answer = service.begin_answer(
         task_id="task",

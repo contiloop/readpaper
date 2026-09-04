@@ -13,6 +13,31 @@ Each role first returns `source_first` without seeing Main's note. The same revi
 
 Main must reopen confirmed source locations and disposition each finding. Accepted factual/coverage issues require descendant remediation records and reviewer recheck. Rejected findings require reopened source evidence. Only genuine source ambiguity may remain interpretive; coverage gaps and source conflicts remain blocking.
 
+### Enforced content-finding evidence
+
+Every recorded content finding remains active until resolved; replacing an audit with an empty result does not erase earlier findings. `check` emits `audit_finding_unresolved:<finding_id>` and a reason in `pending_finding_reasons` when evidence is missing or mismatched.
+
+Main must record `locator_confirmation` with `locator_id` and the full `locator` object from the locator union. The canonical locator ID and bundle must match. Before disposition, reopen those locations using observed `read` or `view_image` calls after the finding's audit-result event. A text frame must cover the confirmed page/span; object/image locators require visual opening. Reopen events must belong to root Main in the disposition's stream/epoch, not to a reviewer or an older context.
+
+A `finding_disposition` payload includes:
+
+```json
+{
+  "finding_id": "<cf_id>",
+  "disposition": "accepted",
+  "rationale": "<source-grounded explanation>",
+  "confirmed_locator_ids": ["<loc_id>"],
+  "source_reopen_event_ids": ["<observed event_id>"],
+  "remediation_record_ids": ["<child note or draft record_id>"]
+}
+```
+
+All finding locators must be included. `rejected` requires confirmed locators, fresh reopening and rationale but no remediation. `interpretive` is allowed only for an `interpretive_ambiguity` finding, with the same source evidence. Other unresolved outcomes remain blockers.
+
+For `accepted`, `partially_accepted` and `modified`, create a changed descendant `understanding_note` or `explanation_draft` after reopening and before disposition, in the same Main epoch. Preserve the entity, set `version_id` and `parent_version_id`, and supply the changed `content_sha256`. The parent must have an observed Main version event; a note correction must descend from the audited `note_version_id` when one is specified. Do not invent a new unrelated note or reuse an unchanged hash as remediation.
+
+Reserve a new attempt for the same reviewer role to inspect that child. Its bound latest `audit_result` must include the finding in `recheck_finding_ids` and a matching `recheck_results` entry with `finding_id`, `status: "resolved"`, and `remediation_record_id`. The result must occur after remediation. Merely asserting `resolved` without the reviewer reservation/binding and exact child reference is insufficient.
+
 ## Flow audit
 
 Use `explanation_flow` only when the fixed condition says it is required. Give it the exact question, requested level, full required text inventory, draft-dependent visuals, fixed note, and fixed draft—never the parent conversation.

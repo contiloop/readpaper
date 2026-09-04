@@ -23,6 +23,7 @@ The workflow combines:
 ├── .agents/skills/readpaper/          # ReadPaper skill, references, and Python runtime
 ├── .codex/agents/                     # reviewer role definitions
 ├── .codex/config.toml                 # project-local Codex settings
+├── .codex/readpaper-context.toml       # context-budget preset source of truth
 ├── .codex/hooks/                      # hook entrypoints
 ├── scripts/install_readpaper.py       # generates local hook wiring
 ├── tests/                             # automated unit and host-probe tests
@@ -86,7 +87,27 @@ That command writes ignored evidence under `evidence/`.
 
 ## Runtime profile and local-state upgrade
 
-The checked-in project profile pins `gpt-5.6-sol` with a 272,000-token context window, a 230,000-token automatic-compaction threshold, a 150,000-token source-emission budget, and a 65,536-token tool-output limit. `check` reports whether every required frame was emitted in the current Main context epoch; this is an observable emission guarantee, not a claim that the host independently proved every earlier tool result remains resident.
+GPT-5.6 Sol supports a 1,050,000-token context window. 272,000 is the input-pricing boundary, not the model's maximum context. Inputs beyond that boundary incur higher pricing. See the [official model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+
+ReadPaper offers two startup presets, defined once in `.codex/readpaper-context.toml` and loaded by `ContextBudgetPolicy`:
+
+| Preset | Context window | Auto compact | Output reserve | Workflow reserve | Source budget |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `long-paper` (default) | 1,050,000 | 850,000 | 128,000 | 72,000 | 650,000 |
+| `cost-controlled` | 272,000 | 230,000 | 32,000 | 48,000 | 150,000 |
+
+The source budget is `auto_compact - output_reserve - workflow_reserve`; available text capacity additionally subtracts 2,000 estimated tokens per visual and 4,000 fixed source-overhead tokens. Transport framing overhead counts toward text usage. Both presets cap each serialized tool response at 65,536 estimated tokens. These are conservative allocation estimates, not a live measurement of Codex context usage or a billing guarantee; `prepare` reports `current_context_usage=null` explicitly.
+
+Before starting a new Desktop session, select a preset and regenerate wiring:
+
+```sh
+.venv/bin/python scripts/install_readpaper.py --write --context-profile long-paper
+# Or: --context-profile cost-controlled
+```
+
+The installer updates top-level `.codex/config.toml` settings, preserves unrelated settings, and refuses preset changes while a local reading run or answer is active. Restart the Desktop session and review/trust its hooks after switching. These are ReadPaper startup presets, not Codex native project profiles: native profile selection is ignored in project-local configuration. Runtime settings that do not match a preset fail closed. See the [Codex configuration reference](https://developers.openai.com/codex/config-reference).
+
+`check` reports whether every required frame was emitted in the current Main context epoch. This is an observable emission guarantee, not independent proof that the host retained every earlier tool result. Initial answer-required reports must begin and finalize in the reading-finalization stream/epoch. After compaction, reopen the full scope, rerun the run-only check and `run --finalize-reading`, then reground the answer in that epoch. Ingest-only runs and later Q&A inherit historical reading coverage and reopen question-relevant sources.
 
 Section/frame inventories use local schema 2. This release deliberately does not read schema-1 run inventories. Before upgrading a checkout that has existing `.readpaper` state, archive it from the repository root and start a new run:
 
@@ -114,6 +135,10 @@ For a new whole-paper request, the expected flow is:
 10. finalize the answer content before sending it.
 
 Use `prepare --ingest-only` only for “read it now; questions later” requests. It can finish at `read_complete` without an answer. Ordinary `prepare` creates an answer-required run, and the Stop hook blocks a paper report until an answer has been begun, grounded, checked, and finalized. Any number of later answers can attach to the same `read_complete` run; finalizing an answer does not complete or mutate the reading lifecycle.
+
+Content-audit findings remain blockers until Main supplies a valid disposition, confirmed locators and post-finding source reopening. Accepted, partially accepted and modified findings additionally require a changed descendant note/draft and a bound reviewer recheck. A later empty audit does not erase an earlier unresolved finding.
+
+Stop visual repairs are explicitly `render → view_image(data.path) → check`. Rendering alone leaves the repair awaiting visual observation. The one-shot repair budget is reserved at request time to prevent duplicates; actual completion requires a matching image-open event. Each new run gets a fresh run-level repair budget.
 
 For this workspace’s Korean report style, `AGENTS.md` currently fixes these defaults:
 

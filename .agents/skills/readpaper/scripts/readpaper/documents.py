@@ -208,6 +208,16 @@ def heading_score(line: str, *, previous_blank: bool, next_blank: bool) -> int:
         score += 6
     numbered = _numbered_heading_match(stripped)
     if numbered is not None:
+        title = numbered.group("title")
+        number = numbered.group("number")
+        # Unpunctuated decimal prefixes need independent heading evidence.
+        explicit_punctuation = bool(re.match(r"^\s*\d+(?:\.\d+)*[.)]\s+", stripped))
+        if number[0].isdigit() and not explicit_punctuation:
+            words = title.split()
+            title_case = bool(words) and all(word[:1].isupper() or word.casefold() in {"a", "an", "the", "of", "and", "for", "in", "to", "with", "on"} for word in words)
+            signals = sum((previous_blank, next_blank, len(words) <= 10, title_case, title.casefold() in KNOWN_HEADINGS))
+            if len(number.split(".")[0]) > 2 or not (title_case or title.casefold() in KNOWN_HEADINGS) or signals < 2:
+                return -100
         score += 5
     if APPENDIX_HEADING_RE.fullmatch(stripped):
         score += 6
@@ -857,34 +867,33 @@ def extract_pdf(
         raise ReadPaperError(ErrorCode.UNSUPPORTED_ARTIFACT, "pdftotext is unavailable")
     pages: list[PageText] = []
     labels = getattr(reader, "page_labels", []) or []
-    with tempfile.TemporaryDirectory(prefix="readpaper-text-") as directory:
-      source = Path(directory) / "source.pdf"
-      source.write_bytes(data)
-      for index, page in enumerate(reader.pages, start=1):
-        box = page.cropbox
-        width = float(box.width)
-        height = float(box.height)
-        if width <= 0 or height <= 0 or width / 72 > MAX_PAGE_INCHES or height / 72 > MAX_PAGE_INCHES:
+    for page in reader.pages:
+        if not (0 < float(page.cropbox.width) <= MAX_PAGE_INCHES * 72 and 0 < float(page.cropbox.height) <= MAX_PAGE_INCHES * 72):
             raise ReadPaperError(ErrorCode.OUTPUT_BUDGET_EXCEEDED, "PDF page dimensions are unsafe")
-        warnings: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="readpaper-text-") as directory:
+        source = Path(directory) / "source.pdf"
+        source.write_bytes(data)
         try:
             completed = subprocess.run(
-                [executable, "-layout", "-enc", "UTF-8", "-f", str(index), "-l", str(index), str(source), "-"],
+                [executable, "-layout", "-enc", "UTF-8", str(source), "-"],
                 capture_output=True, timeout=120, check=False,
             )
         except subprocess.TimeoutExpired as error:
-            raise ReadPaperError(ErrorCode.TIMEOUT, f"text extraction timed out on page {index}") from error
+            raise ReadPaperError(ErrorCode.TIMEOUT, "PDF text extraction timed out") from error
         if completed.returncode != 0:
-            raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, f"pdftotext failed on page {index}")
+            raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, "pdftotext failed")
         try:
-            text = completed.stdout.decode("utf-8")
+            extracted = completed.stdout.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         except UnicodeDecodeError as error:
-            raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, f"pdftotext returned invalid UTF-8 on page {index}") from error
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        if text.endswith("\f"):
-            text = text[:-1]
-            if text.endswith("\n"):
-                text = text[:-1]
+            raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, "pdftotext returned invalid UTF-8") from error
+    page_texts = extracted.split("\f")
+    if page_texts and page_texts[-1] == "":
+        page_texts.pop()
+    if len(page_texts) != len(reader.pages):
+        raise ReadPaperError(ErrorCode.CORRUPT_ARTIFACT, "pdftotext page separators do not match the PDF page count")
+    for index, (page, raw_text) in enumerate(zip(reader.pages, page_texts, strict=True), start=1):
+        text = raw_text.removesuffix("\n")
+        warnings: list[str] = []
         if not text.strip():
             try:
                 warnings.append("suspected_scan" if len(page.images) else "empty_text")
@@ -896,8 +905,8 @@ def extract_pdf(
             PageText(
                 pdf_page=index,
                 pdf_label=labels[index - 1] if index <= len(labels) else None,
-                width_points=width,
-                height_points=height,
+                width_points=float(page.cropbox.width),
+                height_points=float(page.cropbox.height),
                 text=text,
                 text_sha256=digest_text(text),
                 warnings=tuple(warnings),

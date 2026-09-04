@@ -5,7 +5,7 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 ## New paper
 
 1. Call `prepare <source> --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Add `--ingest-only` only when the user explicitly wants the paper read now without a report or answer in this turn; ordinary preparation is answer-required.
-2. Inspect the returned artifact list, unsupported items, warnings, section/frame inventory, visual inventory, and residency estimate. Preparation is not reading.
+2. Inspect the returned artifact list, unsupported items, warnings, section/frame inventory, visual inventory, and residency estimate. If `inventory_inline=false`, obtain section/frame/visual metadata and per-page warnings from `inventory_path`, and the full artifact list including unsupported/excluded candidates from `bundle_manifest_path`, in bounded slices. Full source ranges and hashes live in the inventory; `prepare` returns compact metadata and enforces the serialized envelope limit. Preparation is not reading.
 3. Show the proposed scope. Full scope includes the main paper, references, appendices, and all supported public supplementary items. A reduced scope requires the user's exact exclusion turn and structured excluded refs.
 4. Lock it with `record --kind scope_confirmation`.
 5. Read logical sections in source order. If a section has multiple transport frames, read those frames consecutively in `frame_index` order before moving on. Validate every frame ID, full content hash, source ranges, and all three markers. A truncated or mismatched envelope is a blocker.
@@ -13,7 +13,7 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 7. Repeat all required section frames and visual units in one uninterrupted Main synthesis epoch, then record the understanding note.
 8. Run both content audit roles through source-first and note-comparison stages. Resolve every finding from reopened confirmed source locations.
 9. Call `check` without an answer ID. Resolve blockers until it returns `reading_ready`.
-10. Call `run <run> --finalize-reading --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Confirm `run_state=read_complete` and `active_run_released=true`; the current run remains available for later answers.
+10. Call `run <run> --finalize-reading --task-id <task> --user-turn-id <turn> --client-request-id <cr>`. Confirm `run_state=read_complete` and `active_run_released=true`; the current run remains available for later answers. This also stores Main's reading-finalization stream/epoch.
 11. If this is an ingest-only run, acknowledge reading completion without making paper-content claims and stop here. Otherwise call `answer <run> --begin ...` before composing the user-facing response.
 12. Draft the answer for the current response attempt, run flow audit when required, remediate, finalize the draft, reopen relevant locators, and record grounding.
 13. Call `check --answer-id <answer>`. Resolve blockers until it returns `ready_to_finalize_content`.
@@ -22,7 +22,22 @@ All mutating or context-bearing calls require a fresh UUIDv4-shaped `cr_<32 lowe
 
 ## Follow-up question
 
-Call `answer --begin` on the current `read_complete` run before answer-specific source reopening. Open only the confirmed locations needed for this question in the current attempt and epoch. Create a new draft/finalization/grounding chain, run `check --answer-id`, then `answer --finalize`. Multiple answers may attach to the same completed reading run. Whole-paper coverage and content audits remain inherited and are not repeated unless current full-source emission coverage is explicitly required again.
+Call `answer --begin` on the current `read_complete` run before answer-specific source reopening. Open only the confirmed locations needed for this question in the current attempt and epoch. Create a new draft/finalization/grounding chain, run `check --answer-id`, then `answer --finalize`. Multiple answers may attach to the same completed reading run. Whole-paper coverage and content audits remain inherited for ingest-only runs and answers after the initial report.
+
+## Initial-report context recovery
+
+The first answer of an ordinary answer-required run must begin and finalize in the stream/epoch saved by reading finalization. An abandoned answer does not relax this rule. If compaction or a session change intervenes, `answer --begin` rejects the stale proof and an existing answer's check reports `reading_context_refresh_required`:
+
+1. Reopen all required section frames and visual units in Main's current epoch.
+2. Run `check` without an answer ID; existing valid note/audit evidence is retained, but full current-epoch source emission is required again.
+3. When it returns `reading_ready`, call `run --finalize-reading` again to refresh the context proof without creating a new run.
+4. Begin the first answer, or continue the existing authorized response attempt; review its draft against the reopened source and record fresh current-epoch grounding before `check --answer-id` and `answer --finalize`.
+
+Completion also fails while Main compaction is in progress. Allocation estimates and epoch emission evidence do not prove host memory residency.
+
+## Stop repair
+
+Follow the exact one-shot command returned by Stop. For visual repairs, execute `render`, open the successful response's `data.path` with `view_image`, then rerun `check`. The repair is `awaiting_visual_open` after rendering and `completed` only after the matching Main image-open event. A failed image open does not count. The budget is reserved at request time to prevent duplicate automatic continuations; a new run resets its own allowance.
 
 ## Presentation-only artifact edit
 

@@ -17,6 +17,7 @@ from .audits import (
     validate_content_findings,
 )
 from .canonical import canonical_bytes, digest, digest_text
+from .context_budget import ContextBudgetPolicy
 from .archives import inspect_zip
 from .deletion import DeletionService
 from .documents import (
@@ -29,6 +30,7 @@ from .documents import (
     render_pdf_page,
 )
 from .errors import ErrorCode, ReadPaperError
+from .findings import pending_content_findings
 from .ids import artifact_id, artifact_ref_id, bundle_id, paper_id, sequence_id
 from .models import (
     AnswerStatus,
@@ -76,17 +78,11 @@ ROOT_WRITABLE_RECORDS = {
 }
 REVIEWER_WRITABLE_RECORDS = {"audit_result", "flow_result"}
 
-PINNED_MODEL = "gpt-5.6-sol"
-MODEL_CONTEXT_WINDOW = 272_000
-AUTO_COMPACT_TOKEN_LIMIT = 230_000
-SOURCE_RESIDENCY_TOKEN_LIMIT = 150_000
-NON_SOURCE_CONTEXT_RESERVE = AUTO_COMPACT_TOKEN_LIMIT - SOURCE_RESIDENCY_TOKEN_LIMIT
-TOOL_OUTPUT_TOKEN_LIMIT = 65_536
-
 
 class CommandRuntime:
     def __init__(self, root: Path):
         self.root = root.resolve()
+        self.context_policy = ContextBudgetPolicy.load(self.root)
         self.state = StateService(self.root)
         self.authority = InvocationAuthority(self.root)
         self.deletion = DeletionService(self.root)
@@ -317,8 +313,9 @@ class CommandRuntime:
         emitted_text_tokens = sum(int(item["estimated_tokens"]) for item in all_frames)
         transport_overhead_tokens = max(0, emitted_text_tokens - paper_text_tokens)
         estimated_total_source_tokens = paper_text_tokens + transport_overhead_tokens
-        estimated_visual_tokens = len(visual_units) * 2_000
-        estimated_scope_tokens = estimated_total_source_tokens + estimated_visual_tokens + 4_000
+        policy = self.context_policy
+        estimated_visual_tokens = len(visual_units) * policy.visual_tokens_per_unit
+        estimated_scope_tokens = policy.scope_estimate(estimated_total_source_tokens, len(visual_units))
         inventory = {
             "schema_version": 2,
             "paper_id": paper,
@@ -349,7 +346,7 @@ class CommandRuntime:
             idempotency_key=f"prepare:{invocation.flags['--client-request-id']}:source",
             client_request_id=str(invocation.flags["--client-request-id"]),
         )
-        return self._success(
+        response = self._success(
             invocation.command,
             paper,
             bundle,
@@ -364,9 +361,13 @@ class CommandRuntime:
                 "proposed_scope_kind": "full",
                 "scope_locked": False,
                 "artifacts": artifact_records,
-                "sections": all_sections,
-                "transport_frames": [{**item, "content": None} for item in all_frames],
+                "sections": [{key: item[key] for key in ("section_id", "artifact_ref_id", "title", "ordinal", "start_page", "end_page", "frame_ids", "estimated_tokens")} for item in all_sections],
+                "transport_frames": [{key: item[key] for key in ("frame_id", "section_id", "frame_index", "frame_count", "estimated_tokens")} for item in all_frames],
                 "visual_units": visual_units,
+                "inventory_path": str(self.state.layout.run_dir(paper, run.run_id) / "inventory.json"),
+                "bundle_manifest_path": str(bundle_path),
+                "inventory_inline": True,
+                "inventory_counts": {"sections": len(all_sections), "frames": len(all_frames), "visuals": len(visual_units)},
                 "page_counts": {record["artifact_ref_id"]: len(extracted.pages) for record, extracted in documents if record["media_kind"] == MediaKind.PDF},
                 "paper_input_estimate": estimated_scope_tokens,
                 "artifact_exclusion_estimates": [],
@@ -374,11 +375,11 @@ class CommandRuntime:
                     "pdf_pages": 200,
                     "semantic_unit": "section",
                     "transport_frame_tokens": TRANSPORT_FRAME_TOKEN_LIMIT,
-                    "tool_output_tokens": TOOL_OUTPUT_TOKEN_LIMIT,
-                    "model": PINNED_MODEL,
-                    "model_context_tokens": MODEL_CONTEXT_WINDOW,
-                    "auto_compact_tokens": AUTO_COMPACT_TOKEN_LIMIT,
-                    "source_residency_tokens": SOURCE_RESIDENCY_TOKEN_LIMIT,
+                    "tool_output_tokens": policy.tool_output_token_limit,
+                    "model": policy.model,
+                    "model_context_tokens": policy.model_context_window,
+                    "auto_compact_tokens": policy.auto_compact_limit,
+                    "source_residency_tokens": policy.source_limit,
                 },
                 "residency_plan": {
                     "strategy": "full_source_section_stream",
@@ -386,18 +387,40 @@ class CommandRuntime:
                     "transport_overhead_tokens": transport_overhead_tokens,
                     "estimated_total_source_tokens": estimated_total_source_tokens,
                     "estimated_visual_tokens": estimated_visual_tokens,
-                    "fixed_workflow_reserve_tokens": 4_000,
+                    "fixed_workflow_reserve_tokens": policy.fixed_source_reserve,
                     "estimated_scope_tokens": estimated_scope_tokens,
-                    "model": PINNED_MODEL,
-                    "model_context_tokens": MODEL_CONTEXT_WINDOW,
-                    "target_auto_compact_limit": AUTO_COMPACT_TOKEN_LIMIT,
-                    "non_source_context_reserve_tokens": NON_SOURCE_CONTEXT_RESERVE,
-                    "estimated_to_fit": estimated_scope_tokens <= SOURCE_RESIDENCY_TOKEN_LIMIT,
+                    "profile": policy.profile,
+                    "model": policy.model,
+                    "model_context_tokens": policy.model_context_window,
+                    "target_auto_compact_limit": policy.auto_compact_limit,
+                    "output_reserve_tokens": policy.output_reserve,
+                    "workflow_reserve_tokens": policy.workflow_reserve,
+                    "available_text_tokens": policy.text_limit(len(visual_units)),
+                    "current_context_usage": None,
+                    "usage_policy": "reserved_headroom_not_live_usage_measurement",
+                    "estimated_to_fit": estimated_scope_tokens <= policy.source_limit,
                 },
                 "warnings": [warning for _, extracted in documents for page in extracted.pages for warning in page.warnings],
                 "scope_limitations": [],
             },
         )
+        if estimate_tokens(self._encode(response).decode()) > policy.tool_output_token_limit:
+            data_out = response["data"]
+            # Do not truncate inventories: give a complete on-disk inventory reference.
+            for key in ("sections", "transport_frames", "visual_units", "artifacts", "page_counts", "warnings"):
+                data_out.pop(key)
+            data_out["inventory_inline"] = False
+        self._enforce_output_budget(response)
+        return response
+
+    def _enforce_output_budget(self, response: dict[str, Any]) -> None:
+        tokens = estimate_tokens(self._encode(response).decode("utf-8"))
+        if tokens > self.context_policy.tool_output_token_limit:
+            raise ReadPaperError(
+                ErrorCode.OUTPUT_BUDGET_EXCEEDED,
+                "serialized response exceeds the configured tool output limit",
+                details={"estimated_tokens": tokens, "tool_output_token_limit": self.context_policy.tool_output_token_limit, "run_id": response.get("run_id")},
+            )
 
     def _inventory(self, run_id: str) -> tuple[dict[str, Any], Any]:
         for path in self.state.layout.papers.glob(f"p_*/runs/{run_id}/inventory.json"):
@@ -482,17 +505,7 @@ class CommandRuntime:
             "session_epoch": binding.session_epoch,
         }
         response = self._success("read", run.paper_id, run.bundle_id, run.run_id, data)
-        serialized_tokens = estimate_tokens(self._encode(response).decode("utf-8"))
-        if serialized_tokens > TOOL_OUTPUT_TOKEN_LIMIT:
-            raise ReadPaperError(
-                ErrorCode.OUTPUT_BUDGET_EXCEEDED,
-                "serialized read response exceeds the configured tool output limit",
-                details={
-                    "estimated_tokens": serialized_tokens,
-                    "tool_output_token_limit": TOOL_OUTPUT_TOKEN_LIMIT,
-                    "frame_id": frame_id,
-                },
-            )
+        self._enforce_output_budget(response)
         return response
 
     def _render(self, invocation: Invocation, capability: dict[str, Any]) -> dict[str, Any]:
@@ -607,11 +620,11 @@ class CommandRuntime:
             selected_section_ids = {item["section_id"] for item in selected_sections}
             selected_frames = [item for item in inventory["frames"] if item["section_id"] in selected_section_ids]
             selected_visuals = [item for item in inventory["visual_units"] if item["artifact_ref_id"] in required_set]
-            estimate = sum(int(item["estimated_tokens"]) for item in selected_frames) + len(selected_visuals) * 2000 + 4000
-            if estimate > SOURCE_RESIDENCY_TOKEN_LIMIT:
+            estimate = self.context_policy.scope_estimate(sum(int(item["estimated_tokens"]) for item in selected_frames), len(selected_visuals))
+            if estimate > self.context_policy.source_limit:
                 raise ReadPaperError(
                     ErrorCode.OUTPUT_BUDGET_EXCEEDED,
-                    f"locked scope exceeds the {SOURCE_RESIDENCY_TOKEN_LIMIT:,}-token residency estimate",
+                    f"locked scope exceeds the {self.context_policy.profile} {self.context_policy.source_limit:,}-token scope budget",
                 )
             disclosure = ""
             if scope_kind is ScopeKind.USER_REDUCED:
@@ -823,8 +836,8 @@ class CommandRuntime:
         resident_visuals: set[str] = set()
         audit_result_events: dict[str, dict[str, Any]] = {}
         events_path = self.state.layout.run_events(run.paper_id, run.run_id)
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
+        all_events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+        for event in all_events:
             if event["event_kind"] == "source_frame_emitted" and event["actor"] == "root_main" and event["result"] == "succeeded":
                 frame_id = str(event["subject_id"])
                 historical_frames.add(frame_id)
@@ -855,15 +868,28 @@ class CommandRuntime:
         required_visuals = {item["unit_id"] for item in inventory["visual_units"] if item["artifact_ref_id"] in required_refs}
         missing_historical_visuals = sorted(required_visuals - historical_visuals)
         missing_resident_visuals = sorted(required_visuals - resident_visuals)
+        requested_answer_id = invocation.flags.get("--answer-id")
+        initial_answer_context_required = run.requires_initial_answer_context(
+            requested_answer_id if isinstance(requested_answer_id, str) else None
+        )
+        reading_complete = run.state in {RunState.READ_COMPLETE, RunState.COMPLETE}
+        reading_context_refresh_required = reading_complete and initial_answer_context_required and (
+            run.reading_finalized_context_stream_id != main_context_stream_id
+            or run.reading_finalized_context_epoch != main_context_epoch
+        )
         blockers = []
+        if host_state.get("compact_streams", {}).get(main_context_stream_id, {}).get("open") is not None:
+            blockers.append("main_context_compaction_in_progress")
         if not run.scope_locked:
             blockers.append("scope_not_locked")
-        if run.state in {RunState.READ_COMPLETE, RunState.COMPLETE}:
+        if reading_complete and not initial_answer_context_required:
             blockers.extend(missing_historical_frames)
             blockers.extend(missing_historical_visuals)
         else:
             blockers.extend(missing_resident_section_ids)
             blockers.extend(missing_resident_visuals)
+        if requested_answer_id is not None and reading_context_refresh_required:
+            blockers.append("reading_context_refresh_required")
         record_kinds: dict[str, list[dict[str, Any]]] = {}
         records_path = self.state.layout.run_records(run.paper_id, run.run_id)
         if records_path.exists():
@@ -896,6 +922,7 @@ class CommandRuntime:
             )
         ]
         reviewer_bindings = host_state.get("reviewer_bindings", {})
+        trusted_results = []
         for result_record in latest_results:
             result_payload = result_record.get("payload", {})
             role = str(result_payload.get("role", ""))
@@ -946,6 +973,8 @@ class CommandRuntime:
                     execution_id = result_payload.get("agent_execution_id")
                 if isinstance(execution_id, str):
                     invalid_agent_execution_ids.add(execution_id)
+            else:
+                trusted_results.append(result_record)
 
         pending_audits: list[str] = []
         content_audit_records = [
@@ -969,6 +998,14 @@ class CommandRuntime:
             blockers.append("understanding_note_missing")
         blockers.extend(f"audit:{role}" for role in pending_audits)
         blockers.extend(f"invalid_agent_execution:{item}" for item in sorted(invalid_agent_execution_ids))
+        pending_findings = pending_content_findings(
+            records=[record for group in record_kinds.values() for record in group],
+            events=all_events,
+            inventory=inventory,
+            latest_results=latest_results,
+            trusted_results=trusted_results,
+        )
+        blockers.extend(f"audit_finding_unresolved:{item}" for item in pending_findings)
         requested_answer_id = invocation.flags.get("--answer-id")
         if binding.pending_answer_id is not None and requested_answer_id is not None and requested_answer_id != binding.pending_answer_id:
             raise ReadPaperError(ErrorCode.STATE_CONFLICT, "pending answer cannot be bypassed")
@@ -1002,6 +1039,15 @@ class CommandRuntime:
                 if item["payload"].get("answer_id") == answer_id
                 and item["payload"].get("response_attempt_id") == response_attempt_id
             ]
+            if initial_answer_context_required:
+                current_grounding_ids = {
+                    event.get("payload", {}).get("record_id") for event in all_events
+                    if event.get("event_kind") == "answer_grounded"
+                    and event.get("actor") == "root_main" and event.get("result") == "succeeded"
+                    and event.get("context_stream_id") == main_context_stream_id
+                    and event.get("context_epoch") == main_context_epoch
+                }
+                groundings = [item for item in groundings if item["record_id"] in current_grounding_ids]
             matching_grounding = any(
                 item["payload"].get("final_content_sha256") == finalized_content_sha256
                 for item in groundings
@@ -1040,13 +1086,17 @@ class CommandRuntime:
         elif answer_id is None:
             decision = (
                 "reading_complete"
-                if run.state in {RunState.READ_COMPLETE, RunState.COMPLETE}
+                if reading_complete and not reading_context_refresh_required
                 else "reading_ready"
             )
         else:
             decision = "allow"
         data = {
             "run_state": run.state.value,
+            "initial_answer_context_required": initial_answer_context_required,
+            "reading_context_refresh_required": reading_context_refresh_required,
+            "reading_finalized_context_stream_id": run.reading_finalized_context_stream_id,
+            "reading_finalized_context_epoch": run.reading_finalized_context_epoch,
             "completion_mode": run.completion_mode.value,
             "run_requires_user_facing_answer": (
                 run.completion_mode is RunCompletionMode.ANSWER_REQUIRED
@@ -1091,19 +1141,20 @@ class CommandRuntime:
             "missing_resident_visual_unit_ids": missing_resident_visuals,
             "all_source_frames_emitted_in_current_epoch": not missing_resident_frames,
             "pending_audit_ids": pending_audits,
-            "pending_finding_ids": [],
+            "pending_finding_ids": sorted(pending_findings),
+            "pending_finding_reasons": pending_findings,
             "invalid_agent_execution_ids": sorted(invalid_agent_execution_ids),
             "scope_limitations": [],
             "observer_state": "verified" if host_state_path.exists() else "unavailable",
             "session_epoch": binding.session_epoch,
             "main_context_stream_id": main_context_stream_id,
             "main_context_epoch": main_context_epoch,
-            "auto_resume_count": 0,
+            "auto_resume_count": binding.run_auto_resume_count,
             "answer_id": answer_id,
             "answer_status": answer_status,
             "response_attempt_id": response_attempt_id,
             "response_attempt_status": response_attempt_status,
-            "answer_auto_resume_count": None,
+            "answer_auto_resume_count": binding.answer_auto_resume_counts.get(answer_id, 0) if answer_id else None,
             "answer_delivery_state": answer_delivery_state,
             "finalized_content_sha256": finalized_content_sha256,
             "checked_event_seq": run.event_seq,
@@ -1155,6 +1206,8 @@ class CommandRuntime:
             authority_host_event_id=authority.host_event_id,
             committed_by_agent_execution_id=capability["agent_execution_id"],
             client_request_id=str(invocation.flags["--client-request-id"]),
+            context_stream_id=check_data["main_context_stream_id"],
+            context_epoch=check_data["main_context_epoch"],
         )
         after = self.state.get_run(run.paper_id, run.run_id)
         return self._success(

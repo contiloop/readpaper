@@ -1,5 +1,5 @@
 model = "gpt-5.6-sol"
-model_context_window = 272000
-model_auto_compact_token_limit = 230000
+model_context_window = 1050000
+model_auto_compact_token_limit = 850000
 model_auto_compact_token_limit_scope = "total"
 tool_output_token_limit = 65536
